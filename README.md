@@ -42,6 +42,10 @@ Then follow `README.md` and `docs/DEPLOY.md` inside the rebuilt folder. In short
 - Owner tools: bulk and photo-of-the-store-book inventory import, Team roles, Growth tracking, cold email outreach, "while you were away" summary.
 - Marketing: Muse Image pictures, composed post videos, Instagram, Threads, TikTok publishing.
 
+## Datasets
+
+The Nairaland conversation slice is **not in this repo or the baseline repo**. It is the gated Hugging Face dataset `caleb-mnb/nairaland-conversations`, licensed CC-BY-NC-4.0, and I do not redistribute it. `new/data/corpora/NAIRALAND_PROVENANCE.md` says where it came from, what the licence allows and how I got access. The app runs without it. To use it, request access on Hugging Face, put the file at `data/corpora/raw/nairaland_threads.jsonl` and run `python -m agentic_sales.corpus.build`.
+
 ## Assets
 
 This repo contains no Meta logos, no Jolly, and no generated variations of either. Meta's models are named in plain text.
