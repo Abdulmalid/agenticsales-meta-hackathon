@@ -7,13 +7,14 @@
 - Access: gated repository. The project owner requested access through the Hugging Face
   access form, stating commercial use as the intended purpose. Access was granted with
   no follow-up messages from the author.
-- What this means: access was granted, but the license was NOT changed. Until the author
-  explicitly grants commercial rights (reply message or relicense), treat this slice as
-  **access-permitted, NC-licensed**: safe for research/eval and hackathon demonstration,
-  NOT cleared for commercial production. Seek an explicit commercial grant before it rides
-  in any revenue-serving deployment.
-- Token hygiene: the Hugging Face access token was used once for the download and is not
-  stored anywhere in this repository.
+- Update, 2 Nov 2026: I asked the dataset author, Caleb Olusola, by direct message whether I could use the
+  dataset commercially, including for this hackathon. He replied: "Go for it. It's open source." and
+  "Don't worry about the license." That is his permission as the dataset owner. It is informal and the
+  Hugging Face licence field still reads CC-BY-NC-4.0, so I keep it recorded here and credit him below.
+  It covers his collection only; the posts were written by Nairaland users.
+- Credit: the Nairaland conversation data is the work of Caleb Olusola (`caleb-mnb/nairaland-conversations`
+  on Hugging Face). Every indexed record carries its `source` and `license` fields.
+- Access: the data is not in this repo or the baseline repo, and I do not redistribute it.
 
 Slice: commerce boards only (Business, Phones, Properties, Autos, Technology Market,
 Adverts, Jobs/Vacancies, and kin) in `data/corpora/raw/nairaland_threads.jsonl`

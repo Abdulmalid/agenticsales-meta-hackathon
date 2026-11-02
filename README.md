@@ -63,7 +63,7 @@ Tests: from the rebuilt folder, `python -m unittest discover -s tests` (about 18
 
 ## Datasets
 
-The Nairaland conversation slice is **not in this repo or the baseline repo**. It is the gated Hugging Face dataset `caleb-mnb/nairaland-conversations`, licensed CC-BY-NC-4.0, and I do not redistribute it. `new/data/corpora/NAIRALAND_PROVENANCE.md` says where it came from, what the licence allows and how I got access. The app runs without it. To use it, request access on Hugging Face, put the file at `data/corpora/raw/nairaland_threads.jsonl` and run `python -m agentic_sales.corpus.build`.
+The Nairaland conversation slice is **not in this repo or the baseline repo**. It is the gated Hugging Face dataset `caleb-mnb/nairaland-conversations`, licensed CC-BY-NC-4.0, and I do not redistribute it. Credit: Caleb Olusola, who confirmed on 2 Nov 2026 that I can use it for this project, including commercially. `new/data/corpora/NAIRALAND_PROVENANCE.md` says where it came from, what the licence allows and how I got access. The app runs without it. To use it, request access on Hugging Face, put the file at `data/corpora/raw/nairaland_threads.jsonl` and run `python -m agentic_sales.corpus.build`.
 
 ## Assets
 
