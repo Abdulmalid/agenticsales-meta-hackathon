@@ -22,14 +22,33 @@ That repo was created on 2 Nov only to host the pre-event code. It contains no e
 
 ## How the pieces fit
 
-`setup.sh` (or `setup.ps1` on Windows) clones the baseline at the pinned commit, copies `new/` over it, and applies the patch. The result is the full app. I checked that this rebuilds all 179 changed files byte for byte identical to my working copy.
+`setup.sh` (or `setup.ps1` on Windows) clones the baseline at the pinned commit (`e2ddc9c0213e571c3ea2edf3f42a016ccaae7194`), copies `new/` over it, and applies the patch. The result is the full app. I checked that this rebuilds all 179 changed files byte for byte identical to my working copy, and that the backend test suite passes on the rebuilt copy (659 tests, 28 skipped for missing keys or services).
+
+## Run it
+
+**Option A: the hosted demo, no setup.** Web chat: https://agenticsalesrep.duckdns.org/chat/demo (a live shop on my server, running on Meta's Muse models, rate-limited).
+
+**Option B: run it yourself** (Python 3.12 or newer, Node 20 or newer, a Meta Model API key):
 
 ```bash
-./setup.sh              # or: powershell -File setup.ps1
+./setup.sh                      # or: powershell -File setup.ps1
 cd agenticsales-full
+python -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt        # Windows: .venv/Scripts/python
+export META_MODEL_API_KEY=<your key>                       # ignore .env.example: it is the pre-event file and does not list this
+python -m agentic_sales.cli tenant-create --id demo --config examples/demo_business.json   # prints the admin key once
+python -m agentic_sales.cli serve --port 8000
 ```
 
-Then follow `README.md` and `docs/DEPLOY.md` inside the rebuilt folder. In short: Python 3.12 backend (`pip install -r requirements.txt`), a `META_MODEL_API_KEY`, and the Next.js console in `web/`. Tests run with `python -m unittest discover -s tests`.
+In a second terminal, build the shop's landing page, which turns on the public chat:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/landing -H "Authorization: Bearer <admin key>"      -H "Content-Type: application/json" -d '{"whatsapp":"2348012345678"}'
+```
+
+Then open http://127.0.0.1:8000/chat/demo. For the owner console: `cd web && npm install`, set `BACKEND_URL=http://127.0.0.1:8000` and `SESSION_SECRET=<any long random string>` in `web/.env.local`, run `npm run dev`, and sign in with the admin key.
+
+Tests: from the rebuilt folder, `python -m unittest discover -s tests` (about 18 minutes).
 
 ## What I built this week
 
