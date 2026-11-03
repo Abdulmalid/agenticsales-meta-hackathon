@@ -12868,7 +12868,7 @@ index c720b34..03026f3 100644
        "peerDependencies": {
          "@opentelemetry/api": "^1.1.0",
 diff --git a/web/tests/lib.test.ts b/web/tests/lib.test.ts
-index 806f65d..3a0564e 100644
+index 806f65d..8570bc4 100644
 --- a/web/tests/lib.test.ts
 +++ b/web/tests/lib.test.ts
 @@ -2,10 +2,11 @@ import { test } from "node:test";
@@ -12910,7 +12910,7 @@ index 806f65d..3a0564e 100644
    assert.equal(bodyLimit(["config"]), MAX_BODY_BYTES);
    const base = { method: "POST", origin: null, selfOrigin: "https://app.example", csrfHeader: "1" };
    assert.equal(checkProxyRequest({ ...base, segments: ["products", "T-1", "image"], contentLength: 2_000_000 }).ok, true);
-@@ -140,3 +144,63 @@ test("the proxy reaches the inventory and orders areas but still nothing else",
+@@ -140,3 +144,64 @@ test("the proxy reaches the inventory and orders areas but still nothing else",
    assert.ok(ok(["inventory"]) && ok(["inventory", "sheet", "preview"], "POST") && ok(["orders", "AS-abc", "cancel"], "POST"));
    assert.ok(!ok(["secrets"]));
  });
@@ -12950,6 +12950,7 @@ index 806f65d..3a0564e 100644
 +  assert.equal(h.steps[2].meta, false);
 +  assert.equal(h.steps[3].meta, false);                      // not a Meta model
 +  assert.equal(h.steps[3].ms, 0);
++  assert.equal(modelLabel("meta-models/muse-spark-open-1026", "x"), "Muse Spark Open (Baseten)");
 +  assert.equal(modelLabel(undefined, "AI model"), "AI model");
 +  assert.equal(modelLabel("something-new", "x"), "something-new");
 +});

@@ -72,7 +72,7 @@ Baseline: the last commit before the event is `be5fc98` (16 Oct). Everything bel
 
 **Channels, models, platform**
 - [x] Meta-only models: Muse Spark, Muse Image, voice transcription (`6fb118e`, 27 Oct); Muse Spark reasoning effort and WAV conversion found by running against the real API (`115d243`, 28 Oct); vision (`74f9982`, 28 Oct)
-- [~] Muse Spark Open provider for Baseten (`fce82e0`, 29 Oct): never run against Baseten (needs the key and credits)
+- [x] Muse Spark Open provider for Baseten (`fce82e0`, 29 Oct): **run live.** The server sends photo reading and signal extraction to Muse Spark Open through Baseten (`OPEN_WEIGHTS_TASKS=vision,extractor`). The audit log holds 6 real photo reads on `meta-models/muse-spark-open-1026` between 30 Oct and 2 Nov (Telegram and web chat; confidence 0.92 to 0.99; 5 to 12 s each). Two were product photos that matched no catalogue item; four were payment screenshots. Signal extraction is configured for it too, but the audit log does not record which model did it, so only the photo reads are evidenced
 - [x] Public web chat and Telegram (`6fceede`, 28 Oct); public legal pages (`230d904`, 28 Oct)
 - [x] Playground "Under the hood" timeline of which Meta model ran each step (`d83cb58`, 28 Oct)
 - [x] Connect: one login per platform, TikTok publisher, Threads, Instagram Login (`2a821cf`, `5dab6fa`, `5746ca4`, 27-28 Oct)
@@ -105,7 +105,7 @@ Baseline: the last commit before the event is `be5fc98` (16 Oct). Everything bel
 - [ ] Optional: Muse Wonder 4-second motion banner for WhatsApp Status / Reels
 
 ### D. Open weights
-- [~] Muse Spark Open on Baseten (`OpenWeightsText`, model `meta-models/muse-spark-open-1026`), chosen per task with `OPEN_WEIGHTS_TASKS=conversation,vision,...` plus `BASETEN_API_KEY`; unit-tested, never run against Baseten yet (needs the key)
+- [~] Muse Spark Open on Baseten (`OpenWeightsText`, model `meta-models/muse-spark-open-1026`), chosen per task with `OPEN_WEIGHTS_TASKS=conversation,vision,...` plus `BASETEN_API_KEY`; unit-tested and run live for photo reading (see section 2b)
 - [ ] Credits: Meta Model API ($150), Baseten ($100), Modal ($100) are claimed by the owner, not by code
 
 ### E. Owner-facing intelligence (ideas from reviewing marvyn.io, see section 5)

@@ -11,6 +11,8 @@ const MODELS: Record<string, string> = {
   "muse-spark-1.3": "Muse Spark",
   "muse-voice-transcribe-1.0": "Muse Voice Transcribe",
   "muse-image-1.0": "Muse Image",
+  "meta-models/muse-spark-open-1026": "Muse Spark Open (Baseten)",
+  "muse-wonder-1.0": "Muse Wonder",
 };
 export const modelLabel = (name: unknown, fallback: string) => (typeof name === "string" && name ? MODELS[name] ?? name : fallback);
 

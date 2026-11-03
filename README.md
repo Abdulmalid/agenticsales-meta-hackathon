@@ -71,6 +71,14 @@ The full Nairaland conversation dataset is **not in this repo or the baseline re
 
 This repo contains no Meta logos, no Jolly, and no generated variations of either. Meta's models are named in plain text.
 
+## Known gaps
+
+- **No scheduler or background worker.** Follow-ups, outbox sends and summaries run when the owner triggers them or a customer writes, not on an internal timer. A scheduler is planned after the event.
+- **The live server uses a free address on one VM.** A custom domain and a second server are post-event work.
+- **Instagram and WhatsApp direct messages** are built but blocked by Meta's own gates, so the demo runs on Telegram and the web chat.
+- **Muse Spark Open on Baseten** is evidenced for photo reading (6 live calls, 30 Oct to 2 Nov); the other tasks are only unit-tested against it.
+- **Other model vendors' modules** (Anthropic, Gemini) are pre-event files. The server is set to Meta only (`MODEL_PROVIDER=meta`), and nothing built during the event uses them.
+
 ## Honest limits
 
 Instagram and WhatsApp direct messages are built but blocked by Meta's own gates, so they are not part of the demo, which runs on Telegram and the web chat. See `HACKATHON.md`.
