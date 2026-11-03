@@ -40,7 +40,8 @@ def beats_of(script: dict | None) -> list[tuple[str, str, float]]:
         if not isinstance(b, dict):
             continue
         seconds = _seconds(str(b.get("t", "")))
-        out.append((str(b.get("visual") or "")[:400], " ".join(str(b.get("on_screen_text") or "").split())[:90], seconds))
+        words = " ".join(str(b.get("on_screen_text") or b.get("voiceover") or "").split())
+        out.append((str(b.get("visual") or "")[:400], " ".join(words.split(" ")[:10])[:90], seconds))          # the screen shows what the script says
     return out
 
 

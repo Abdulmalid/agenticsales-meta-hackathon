@@ -22,7 +22,7 @@ export default async function BooksPage() {
         <Stat label="Profit this week" value={naira(b.week.profit_kobo)} icon={<Icon name="analytics" />} hint={`${naira(b.week.revenue_kobo)} in · ${naira(b.week.expenses_kobo)} out`} />
         <Stat label="Profit this month" value={naira(b.month.profit_kobo)} icon={<Icon name="target" />} hint={`${naira(b.month.revenue_kobo)} in · ${naira(b.month.expenses_kobo)} out`} />
       </div>
-      <ExpenseBook recent={b.recent} categories={b.month.by_category} isAdmin={session?.role === "admin"} />
+      <ExpenseBook recent={b.recent} categories={b.month.by_category} limits={b.limits} isAdmin={session?.role === "admin"} />
     </>
   );
 }

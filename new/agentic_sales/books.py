@@ -13,6 +13,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS expenses(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, amount_kobo INTEGER NOT NULL, category TEXT NOT NULL,
   note TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT 'owner');
+CREATE TABLE IF NOT EXISTS book_limits(key TEXT PRIMARY KEY, kobo INTEGER NOT NULL);
 """
 CATEGORIES = {
     "transport": ("transport", "bolt", "uber", "bus", "okada", "keke", "logistics", "dispatch", "delivery", "waybill", "fare"),
@@ -78,14 +79,46 @@ def window(word: str | None, now: datetime) -> tuple[datetime, datetime, str]:
     return start.astimezone(timezone.utc), now, "today"
 
 
+class OverLimit(ValueError):
+    """An expense above the owner's own limit. The message says which limit and what to do."""
+
+
 class Books:
     def __init__(self, memory):
         self.con = memory.con
         self.con.executescript(_SCHEMA)
 
-    def add(self, amount_kobo: int, note: str = "", category: str | None = None, source: str = "owner", now: datetime | None = None) -> dict:
+    def limits(self) -> dict[str, int | None]:
+        """The owner's spending limits in kobo: one expense, and everything logged in a Lagos day. None means no limit."""
+        got = {k: v for k, v in self.con.execute("SELECT key, kobo FROM book_limits")}
+        return {"per_expense_kobo": got.get("per_expense"), "daily_kobo": got.get("daily")}
+
+    def set_limits(self, per_expense_kobo: int | None, daily_kobo: int | None) -> None:
+        with self.con:
+            for key, v in (("per_expense", per_expense_kobo), ("daily", daily_kobo)):
+                if v is None:
+                    self.con.execute("DELETE FROM book_limits WHERE key=?", (key,))
+                else:
+                    self.con.execute("INSERT OR REPLACE INTO book_limits(key,kobo) VALUES(?,?)", (key, int(v)))
+
+    def over_limit(self, amount_kobo: int, now: datetime | None = None) -> str | None:
+        """Why this expense is above a limit the owner set, or None."""
+        lim, now = self.limits(), now or datetime.now(timezone.utc)
+        if lim["per_expense_kobo"] is not None and amount_kobo > lim["per_expense_kobo"]:
+            return f"{money_text(amount_kobo)} is above your limit of {money_text(lim['per_expense_kobo'])} for one expense."
+        if lim["daily_kobo"] is not None:
+            start, end, _ = window("today", now)
+            spent = self.summary(start, end)["expenses_kobo"]
+            if spent + amount_kobo > lim["daily_kobo"]:
+                return f"With the {money_text(spent)} already spent today, {money_text(amount_kobo)} would go over your daily limit of {money_text(lim['daily_kobo'])}."
+        return None
+
+    def add(self, amount_kobo: int, note: str = "", category: str | None = None, source: str = "owner", now: datetime | None = None,
+            confirmed: bool = False) -> dict:
         if not 0 < amount_kobo <= MAX_EXPENSE_KOBO:
             raise ValueError("the amount must be more than zero")
+        if not confirmed and (why := self.over_limit(amount_kobo, now)):
+            raise OverLimit(why)
         row = {"ts": (now or datetime.now(timezone.utc)).isoformat(), "amount_kobo": int(amount_kobo), "note": note.strip()[:120],
                "category": (category or categorize(note)).strip()[:30] or "other", "source": source[:20]}
         with self.con:
@@ -142,7 +175,10 @@ def owner_reply(books: Books, text: str, now: datetime | None = None) -> str | N
     parsed = parse_expense(t)
     if parsed:
         kobo, note = parsed
-        row = books.add(kobo, note, source="chat", now=now)
+        try:
+            row = books.add(kobo, note, source="chat", now=now)
+        except OverLimit as e:
+            return f"Not logged. {e} Change your limit or add it yourself in Books on the console."
         start, end, _ = window("today", now)
         day = books.summary(start, end)
         return (f"Logged {money_text(kobo)} · {row['category']}{' (' + note + ')' if note else ''}. "

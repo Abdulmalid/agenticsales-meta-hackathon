@@ -157,6 +157,58 @@ class ThePictureMatchesThePost(unittest.TestCase):
         self.assertEqual(self.store.get(i)["image_prompt"], "The iPhone 15 box on a Lagos market table, daylight")
 
 
+class TheVideoMatchesTheScript(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.store = ContentStore(TenantMemory(TenantContext("bola"), self.root))
+        self.images = FakeImages()
+        self.agent = ContentAgent(cfg(), self.root, "bola", ModelRouter(media={TaskKind.IMAGE: self.images}), self.store, None)
+
+    def test_each_beat_is_drawn_from_its_own_scene_not_the_posts_caption(self):
+        item = {"caption": "Upgrade to the iPhone 15 today", "image_prompt": "a woman holding the phone", "product_sku": "IP15"}
+        brief = self.agent.reel_brief(item, "the sealed box beside a receipt on a counter")
+        self.assertIn("Show exactly this: the sealed box beside a receipt on a counter", brief)
+        self.assertIn("The product: iPhone 15", brief)
+        self.assertNotIn("Upgrade to the iPhone 15 today", brief)                  # the caption made every frame look the same
+        self.assertNotIn("woman", brief)
+        self.assertIn("no people", brief.lower())
+
+    def test_a_beat_with_no_on_screen_text_shows_what_the_voiceover_says_in_a_few_words(self):
+        beats = reel.beats_of({"beats": [{"t": "0-3s", "visual": "v", "voiceover": "Get the new iPhone 15 today with free delivery across all of Lagos now", "on_screen_text": ""}]})
+        self.assertEqual(beats[0][1], "Get the new iPhone 15 today with free delivery across")
+
+    def test_words_set_by_the_studio_are_not_drawn_again_by_ffmpeg(self):
+        item = {"caption": "x", "image_prompt": "y", "product_sku": "IP15"}
+        with mock.patch.object(ContentAgent, "_reel_frame", return_value=b"studio-made"):
+            f = self.agent._framed(item, PNG, "Brand new", 3.0, False)
+        self.assertEqual((f.image, f.text), (b"studio-made", ""))
+        with mock.patch.object(ContentAgent, "_reel_frame", side_effect=lambda i, p, t, last: p):
+            f = self.agent._framed(item, PNG, "Brand new", 3.0, False)
+        self.assertEqual((f.image, f.text), (PNG, "Brand new"))                  # no studio libraries: the old on-screen text still shows
+
+    def test_with_the_drawing_libraries_installed_the_frame_really_is_made_by_the_studio(self):
+        from agentic_sales.design import service
+        if service.available() is not None:
+            self.skipTest("needs the drawing libraries (use the project .venv)")
+        from PIL import Image
+        import io
+        buf = io.BytesIO()
+        Image.new("RGB", (540, 960), (20, 40, 60)).save(buf, "PNG")
+        item = {"caption": "x", "image_prompt": "y", "product_sku": "IP15"}
+        done = self.agent._reel_frame(item, buf.getvalue(), "Brand new. Sealed.", False)
+        self.assertIsNot(done, buf.getvalue())
+        self.assertEqual(Image.open(io.BytesIO(done)).size, (720, 1280))
+
+    def test_a_failed_picture_reuses_the_last_plain_picture_not_a_frame_that_already_has_words(self):
+        i = self.store.add(campaign_id="c", platform="instagram", caption="New stock", hashtags=[], cta="DM us", image_prompt="a phone", video_script=SCRIPT,
+                           status="pending_approval", violations=[])
+        self.agent.router.media[TaskKind.IMAGE] = FakeImages(fail_after=1)
+        seen = []
+        with mock.patch.object(ContentAgent, "_reel_frame", side_effect=lambda it, pic, t, last: seen.append(pic) or b"framed"),              mock.patch("agentic_sales.agents.content.reel.render", side_effect=lambda frames, out: (out.parent.mkdir(parents=True, exist_ok=True), out.write_bytes(b"mp4"), out)[2]):
+            self.agent.generate_reel(i)
+        self.assertEqual(seen, [PNG, PNG])
+
+
 class PostingTheVideo(unittest.TestCase):
     ITEM = {"caption": "New stock", "hashtags": ["Lagos"], "video_url": "https://api.example/media/bola/a.mp4", "image_url": None}
 

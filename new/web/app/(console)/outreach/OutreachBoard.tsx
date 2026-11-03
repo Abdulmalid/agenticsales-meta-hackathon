@@ -7,7 +7,7 @@ import { relTime, titleCase } from "@/lib/format";
 import type { OutreachProspect, OutreachState } from "@/lib/types";
 
 const TONE: Record<string, "neutral" | "ok" | "warn" | "danger" | "info" | "brand"> = {
-  new: "neutral", drafted: "info", approved: "brand", sent: "ok", replied: "ok", unsubscribed: "warn", failed: "danger",
+  new: "neutral", drafted: "info", approved: "brand", sent: "ok", replied: "ok", unsubscribed: "warn", failed: "danger", not_fit: "warn",
 };
 
 /** First line may be a header (email,name,company,note). Commas inside a note are fine: only the first three commas split. */
@@ -62,6 +62,7 @@ export function OutreachBoard({ initial }: { initial: OutreachState }) {
     if (d) setBlocked(d.blocked);
   };
   const saveDetails = (p: OutreachProspect) => run("who" + p.id, `outreach/prospects/${p.id}/details`, "PUT", who, () => "Saved.");
+  const keep = (p: OutreachProspect) => run("keep" + p.id, `outreach/prospects/${p.id}/keep`, "POST", {}, () => "Kept. They will be drafted next.");
   const save = (p: OutreachProspect) => run("save" + p.id, `outreach/prospects/${p.id}`, "PUT", edit, () => "Saved. Approve it again to send it.");
 
   return (
@@ -122,6 +123,8 @@ export function OutreachBoard({ initial }: { initial: OutreachState }) {
                         <>
                           <strong>{p.name || p.email}</strong>
                           <div className="small muted">{p.name ? p.email : ""}{p.title ? ` · ${p.title}` : ""}{p.company ? ` · ${p.company}` : ""}</div>
+                          {p.fit != null && <div className="small muted">Fit {p.fit}/100{p.fit_reason ? `: ${p.fit_reason}` : ""}{p.fit_model ? ` (${p.fit_model})` : ""}</div>}
+                          {p.status === "not_fit" && <button className="btn sm ghost" disabled={!!busy} onClick={() => keep(p)}>Keep anyway</button>}
                           {!["sent", "replied", "unsubscribed"].includes(p.status) && <button className="btn sm ghost" onClick={() => { setWhoOpen(p.id); setWho({ name: p.name, company: p.company, title: p.title ?? "", note: p.note }); }}>Edit details</button>}
                         </>
                       )}
