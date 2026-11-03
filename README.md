@@ -4,7 +4,7 @@ AgenticSales is an AI sales rep for small businesses in Nigeria. It answers cust
 
 ## What this repo holds, and what it does not
 
-This repo holds **only work done during the event** (from 26 Oct 2026): 92 new files, plus the changes I made to 106 existing files.
+This repo holds **only work done during the event** (from 26 Oct 2026): 95 new files, plus the changes I made to 107 existing files.
 
 The code that existed before the event is **not** in this repo. It lives in a separate public repo:
 
@@ -15,8 +15,8 @@ That repo was created on 2 Nov only to host the pre-event code. It contains no e
 | | Where | What |
 |---|---|---|
 | Before the event | `agenticsales-baseline` | The structure only: the console screens, the account-connection forms (links with nothing behind them yet), and early backend code. It did not work end to end: no Meta models, no live payments, no voice, no photo understanding, no posting |
-| During the event | this repo, `new/` | 92 files I wrote from scratch (Meta provider, voice, vision, outreach, books, growth, history, order tracking, Team, scheduler, design studio, and more) with their tests |
-| During the event | this repo, `patches/event-changes.patch` | The changes to 106 existing files, which is where most of the making-it-work happened. It is a standard `git diff`, so every change shows the old line it replaces |
+| During the event | this repo, `new/` | 95 files I wrote from scratch (Meta provider, voice, vision, outreach, books, growth, history, order tracking, Team, scheduler, design studio, and more) with their tests |
+| During the event | this repo, `patches/event-changes.patch` | The changes to 107 existing files, which is where most of the making-it-work happened. It is a standard `git diff`, so every change shows the old line it replaces |
 
 In short: before the event I had the skeleton of the product. Everything that makes it run end to end, on Meta's models, is from this week.
 
@@ -24,7 +24,7 @@ In short: before the event I had the skeleton of the product. Everything that ma
 
 ## How the pieces fit
 
-`setup.sh` (or `setup.ps1` on Windows) clones the baseline at the pinned commit (`e2ddc9c0213e571c3ea2edf3f42a016ccaae7194`), copies `new/` over it, and applies the patch. The result is the full app. I checked that this rebuilds all 198 changed files byte for byte identical to my working copy, and that the backend test suite passes on the rebuilt copy (729 tests, 28 skipped for missing keys or services). The full run found one failure, a stray control character in a regex that I had introduced; I fixed it and re-ran that test and its neighbours on the rebuilt copy, which pass.
+`setup.sh` (or `setup.ps1` on Windows) clones the baseline at the pinned commit (`e2ddc9c0213e571c3ea2edf3f42a016ccaae7194`), copies `new/` over it, and applies the patch. The result is the full app. I checked that this rebuilds all 202 changed files byte for byte identical to my working copy, and that the backend test suite passes on the rebuilt copy (732 tests, 28 skipped for missing keys or services). The full run passes on the rebuilt copy.
 
 ## Run it
 
@@ -91,3 +91,7 @@ This repo contains no Meta logos, no Jolly, and no generated variations of eithe
 ## Honest limits
 
 Instagram and WhatsApp direct messages are built but blocked by Meta's own gates, so they are not part of the demo, which runs on Telegram and the web chat. See `HACKATHON.md`.
+
+## License
+
+MIT (see `LICENSE`). The Nairaland sample under `new/data/corpora/` keeps its own terms; see its provenance file.

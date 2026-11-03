@@ -179,7 +179,7 @@ class PostingAndAutomation(unittest.TestCase):
 
     def finished_design(self, **over):
         import time
-        with mock.patch("agentic_sales.server.app.design.make", return_value=self.made(**over)):
+        with mock.patch("agentic_sales.server.app.design.make", return_value=self.made(**over)),              mock.patch("agentic_sales.server.app.design.available", return_value=None):       # the design itself is mocked, so the drawing libraries are not needed
             job = self.c.post("/v1/design", headers=self.H, json={"request": "Flyer for the iPhone 15", "sku": "IP15"}).json()["job"]
             for _ in range(100):
                 if self.c.get(f"/v1/design/jobs/{job}", headers=self.H).json()["status"] != "working":
