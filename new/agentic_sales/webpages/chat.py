@@ -28,6 +28,8 @@ textarea{flex:1;resize:none;min-height:44px;max-height:120px;padding:.6rem .7rem
 button,label.btn{border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:12px;min-width:44px;height:44px;padding:0 .7rem;font:inherit;cursor:pointer;display:inline-flex;align-items:center;justify-content:center}
 button.primary{background:var(--brand);color:var(--brand-fg);border-color:var(--brand);font-weight:600}
 button.rec{background:#b3261e;color:#fff;border-color:#b3261e}
+#mic .i-stop{display:none}#mic.rec .i-stop{display:inline}#mic.rec .i-mic{display:none}
+.btn svg,#mic svg{vertical-align:middle}
 button:disabled{opacity:.5;cursor:default}
 #preview{display:none;padding:.4rem .8rem;border-top:1px solid var(--line);align-items:center;gap:.6rem}
 #preview img{height:52px;border-radius:8px;border:1px solid var(--line)}
@@ -121,14 +123,14 @@ mic.addEventListener("click", async () => {
       stream.getTracks().forEach((t) => t.stop());
       const mime = (recorder.mimeType || type || "audio/webm").split(";")[0];
       const blob = new Blob(chunks, { type: mime });
-      recorder = null; mic.classList.remove("rec"); mic.textContent = "🎙️"; mic.setAttribute("aria-label", "Record a voice note");
+      recorder = null; mic.classList.remove("rec"); mic.setAttribute("aria-label", "Record a voice note");
       if (blob.size < 800) { add("bot", "That voice note was too short. Hold on a little longer."); return; }
       if (blob.size > 1800000) { add("bot", "That voice note is too long. Please keep it under a minute."); return; }
-      add("me", "🎙️ Voice note");
+      add("me", "Voice note");
       post({ audio: await blobToB64(blob), audio_mime: mime });
     };
     recorder.start();
-    mic.classList.add("rec"); mic.textContent = "⏹"; mic.setAttribute("aria-label", "Stop recording");
+    mic.classList.add("rec"); mic.setAttribute("aria-label", "Stop recording");
     stopTimer = setTimeout(() => { if (recorder) recorder.stop(); }, 60000);
   } catch (err) { recorder = null; add("bot", "I couldn't use the microphone. Please allow access, or type your message."); }
 });
@@ -145,8 +147,8 @@ def page(tenant_id: str, business_name: str, agent_name: str = "") -> str:
             '<div id="log" role="log" aria-live="polite"><div class="hint">Ask about products, prices or delivery. You can send a photo of what you want, or a voice note. '
             "A team member can step in at any time.</div></div>"
             '<div id="preview"><img id="pimg" alt="Photo ready to send"><button type="button" id="rm">Remove photo</button></div>'
-            '<form id="f"><label class="btn" title="Send a photo">📷<input id="file" type="file" accept="image/*" hidden aria-label="Attach a photo"></label>'
-            '<button type="button" id="mic" aria-label="Record a voice note">🎙️</button>'
+            '<form id="f"><label class="btn" title="Send a photo"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg><input id="file" type="file" accept="image/*" hidden aria-label="Attach a photo"></label>'
+            '<button type="button" id="mic" aria-label="Record a voice note"><svg class="i-mic" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg><svg class="i-stop" width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>'
             '<textarea id="box" rows="1" maxlength="1000" placeholder="Type your message…" aria-label="Your message"></textarea>'
             '<button class="primary" id="send" type="submit">Send</button></form>'
             "<footer>Virtual assistant: it can make mistakes, a team member can step in, and a payment is only confirmed by the payment provider.</footer>"

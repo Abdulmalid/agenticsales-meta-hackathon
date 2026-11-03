@@ -4,7 +4,7 @@ AgenticSales is an AI sales rep for small businesses in Nigeria. It answers cust
 
 ## What this repo holds, and what it does not
 
-This repo holds **only work done during the event** (from 26 Oct 2026): 76 new files, plus the changes I made to 103 existing files.
+This repo holds **only work done during the event** (from 26 Oct 2026): 78 new files, plus the changes I made to 104 existing files.
 
 The code that existed before the event is **not** in this repo. It lives in a separate public repo:
 
@@ -15,14 +15,14 @@ That repo was created on 2 Nov only to host the pre-event code. It contains no e
 | | Where | What |
 |---|---|---|
 | Before the event | `agenticsales-baseline` | The sales agent pipeline, language layer, leads and fraud logic, payments with gateway-confirmed payment, approvals, content planning, the operator and business consoles, inventory and orders, Facebook / Instagram / X connect |
-| During the event | this repo, `new/` | 76 files I wrote from scratch (Meta provider, voice, vision, outreach, books, growth, history, order tracking, Team, and more) with their tests |
-| During the event | this repo, `patches/event-changes.patch` | The changes to 103 existing files. It is a standard `git diff`, so every change shows the old line it replaces |
+| During the event | this repo, `new/` | 78 files I wrote from scratch (Meta provider, voice, vision, outreach, books, growth, history, order tracking, Team, and more) with their tests |
+| During the event | this repo, `patches/event-changes.patch` | The changes to 104 existing files. It is a standard `git diff`, so every change shows the old line it replaces |
 
 `HACKATHON.md` lists every feature with its commit and date, and says which ones I ran for real and which are only unit-tested.
 
 ## How the pieces fit
 
-`setup.sh` (or `setup.ps1` on Windows) clones the baseline at the pinned commit (`e2ddc9c0213e571c3ea2edf3f42a016ccaae7194`), copies `new/` over it, and applies the patch. The result is the full app. I checked that this rebuilds all 179 changed files byte for byte identical to my working copy, and that the backend test suite passes on the rebuilt copy (659 tests, 28 skipped for missing keys or services).
+`setup.sh` (or `setup.ps1` on Windows) clones the baseline at the pinned commit (`e2ddc9c0213e571c3ea2edf3f42a016ccaae7194`), copies `new/` over it, and applies the patch. The result is the full app. I checked that this rebuilds all 182 changed files byte for byte identical to my working copy, and that the backend test suite passes on the rebuilt copy (665 tests, 28 skipped for missing keys or services).
 
 ## Run it
 
@@ -62,6 +62,8 @@ Tests: from the rebuilt folder, `python -m unittest discover -s tests` (about 18
 - Marketing: Muse Image pictures, composed post videos, Instagram, Threads, TikTok publishing.
 
 ## Datasets
+
+A small sample of the project's own Nigerian Pidgin, Nigerian English and Nigerian conversation corpora is in `new/data/corpora/sample/` (about 1,700 records, 9.7 MB, every topic layer). Copy it into `data/corpora/raw/` and run `python -m agentic_sales.corpus.build` to try the local behaviour without the full 900 MB set; the hosted demo runs on the full set. See the README in that folder.
 
 The Nairaland conversation slice is **not in this repo or the baseline repo**. It is the gated Hugging Face dataset `caleb-mnb/nairaland-conversations`, licensed CC-BY-NC-4.0, and I do not redistribute it. Credit: Caleb Olusola, who confirmed on 2 Nov 2026 that I can use it for this project, including commercially. `new/data/corpora/NAIRALAND_PROVENANCE.md` says where it came from, what the licence allows and how I got access. The app runs without it. To use it, request access on Hugging Face, put the file at `data/corpora/raw/nairaland_threads.jsonl` and run `python -m agentic_sales.corpus.build`.
 
