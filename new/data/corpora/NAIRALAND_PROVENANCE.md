@@ -14,7 +14,8 @@
   It covers his collection only; the posts were written by Nairaland users.
 - Credit: the Nairaland conversation data is the work of Caleb Olusola (`caleb-mnb/nairaland-conversations`
   on Hugging Face). Every indexed record carries its `source` and `license` fields.
-- Access: the data is not in this repo or the baseline repo, and I do not redistribute it.
+- A small sample (393 threads, scrubbed of any contact-style detail) is in `sample/nairaland_threads.jsonl`, shared with the author's permission and with credit.
+  The full dataset is not in this repo or the baseline repo; get it from Hugging Face.
 
 Slice: commerce boards only (Business, Phones, Properties, Autos, Technology Market,
 Adverts, Jobs/Vacancies, and kin) in `data/corpora/raw/nairaland_threads.jsonl`

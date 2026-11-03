@@ -63,9 +63,9 @@ Tests: from the rebuilt folder, `python -m unittest discover -s tests` (about 18
 
 ## Datasets
 
-A small sample of the project's own Nigerian Pidgin, Nigerian English and Nigerian conversation corpora is in `new/data/corpora/sample/` (about 1,700 records, 9.7 MB, every topic layer). Copy it into `data/corpora/raw/` and run `python -m agentic_sales.corpus.build` to try the local behaviour without the full 900 MB set; the hosted demo runs on the full set. See the README in that folder.
+A small sample of the project's own Nigerian Pidgin, Nigerian English and Nigerian conversation corpora, plus the Nairaland slice, is in `new/data/corpora/sample/` (about 2,100 records, 10.2 MB, every topic layer). Copy it into `data/corpora/raw/` and run `python -m agentic_sales.corpus.build` to try the local behaviour without the full 900 MB set; the hosted demo runs on the full set. See the README in that folder.
 
-The Nairaland conversation slice is **not in this repo or the baseline repo**. It is the gated Hugging Face dataset `caleb-mnb/nairaland-conversations`, licensed CC-BY-NC-4.0, and I do not redistribute it. Credit: Caleb Olusola, who confirmed on 2 Nov 2026 that I can use it for this project, including commercially. `new/data/corpora/NAIRALAND_PROVENANCE.md` says where it came from, what the licence allows and how I got access. The app runs without it. To use it, request access on Hugging Face, put the file at `data/corpora/raw/nairaland_threads.jsonl` and run `python -m agentic_sales.corpus.build`.
+The full Nairaland conversation dataset is **not in this repo or the baseline repo**. It is `caleb-mnb/nairaland-conversations` on Hugging Face (gated, CC-BY-NC-4.0). A small scrubbed sample of it (393 threads) is in the sample folder, shared with the author's permission. Credit: Caleb Olusola, who confirmed on 2 Nov 2026 that I can use it for this project, including commercially. `new/data/corpora/NAIRALAND_PROVENANCE.md` says where it came from, what the licence allows and how I got access. The app runs without it. To use it, request access on Hugging Face, put the file at `data/corpora/raw/nairaland_threads.jsonl` and run `python -m agentic_sales.corpus.build`.
 
 ## Assets
 

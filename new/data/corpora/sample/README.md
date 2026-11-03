@@ -14,4 +14,6 @@ python -m agentic_sales.corpus.build      # a few seconds; builds data/index/cor
 
 The build reports the other corpora as missing. That is expected; the agent still answers and uses what is indexed.
 
-The Nairaland conversation slice is not part of this sample; see `../NAIRALAND_PROVENANCE.md`.
+`nairaland_threads.jsonl` is a small slice (393 threads, 25 per board at most) of Caleb Olusola's dataset `caleb-mnb/nairaland-conversations`, shared here with his permission
+(see `../NAIRALAND_PROVENANCE.md`) and with credit to him. Every record keeps its `source`, `thread_url` and `license` fields. Usernames were already pseudonymised by the
+dataset; I additionally dropped every thread containing a link, email, phone number or handle. It is not the whole dataset; get that from Hugging Face.
