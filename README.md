@@ -4,7 +4,7 @@ AgenticSales is an AI sales rep for small businesses in Nigeria. It answers cust
 
 ## What this repo holds, and what it does not
 
-This repo holds **only work done during the event** (from 26 Oct 2026): 95 new files, plus the changes I made to 107 existing files.
+This repo holds **only work done during the event** (from 26 Oct 2026): 97 new files, plus the changes I made to 107 existing files.
 
 The code that existed before the event is **not** in this repo. It lives in a separate public repo:
 
@@ -15,7 +15,7 @@ That repo was created on 2 Nov only to host the pre-event code. It contains no e
 | | Where | What |
 |---|---|---|
 | Before the event | `agenticsales-baseline` | The structure only: the console screens, the account-connection forms (links with nothing behind them yet), and early backend code. It did not work end to end: no Meta models, no live payments, no voice, no photo understanding, no posting |
-| During the event | this repo, `new/` | 95 files I wrote from scratch (Meta provider, voice, vision, outreach, books, growth, history, order tracking, Team, scheduler, design studio, and more) with their tests |
+| During the event | this repo, `new/` | 97 files I wrote from scratch (Meta provider, voice, vision, outreach, books, growth, history, order tracking, Team, scheduler, design studio, and more) with their tests |
 | During the event | this repo, `patches/event-changes.patch` | The changes to 107 existing files, which is where most of the making-it-work happened. It is a standard `git diff`, so every change shows the old line it replaces |
 
 In short: before the event I had the skeleton of the product. Everything that makes it run end to end, on Meta's models, is from this week.
@@ -24,7 +24,7 @@ In short: before the event I had the skeleton of the product. Everything that ma
 
 ## How the pieces fit
 
-`setup.sh` (or `setup.ps1` on Windows) clones the baseline at the pinned commit (`e2ddc9c0213e571c3ea2edf3f42a016ccaae7194`), copies `new/` over it, and applies the patch. The result is the full app. I checked that this rebuilds all 202 changed files byte for byte identical to my working copy, and that the backend test suite passes on the rebuilt copy (732 tests, 28 skipped for missing keys or services). The full run passes on the rebuilt copy.
+`setup.sh` (or `setup.ps1` on Windows) clones the baseline at the pinned commit (`e2ddc9c0213e571c3ea2edf3f42a016ccaae7194`), copies `new/` over it, and applies the patch. The result is the full app. I checked that this rebuilds all 204 changed files byte for byte identical to my working copy, and that the backend test suite passes on the rebuilt copy (751 tests, 28 skipped for missing keys or services). The full run passes on the rebuilt copy.
 
 ## Run it
 
@@ -63,7 +63,9 @@ Tests: from the rebuilt folder, `python -m unittest discover -s tests` (about 18
 - Owner tools: bulk and photo-of-the-store-book inventory import, Team roles, Growth tracking, cold email outreach, "while you were away" summary.
 - Marketing: Muse Image pictures, composed post videos, Instagram, Threads, TikTok publishing.
 - Design studio (3 Nov): flyers and post images from a plain request. Muse Image paints a picture with no text in it, or the owner's own product photo is used; all lettering is set as sharp vector type; Muse Spark rates the result. Prices come from the catalogue, never from a model. A finished design can be posted from the studio, through the same approval queue as any post.
-- Quality benchmark: flyers, pictures and video frames must reach 90/100 (`DESIGN_MIN_SCORE`) from Muse Spark's rating. Below it a picture is redrawn with the defects fed back, then the post is flagged so it cannot be approved.
+- Quality benchmark: flyers, pictures and video frames must reach 90/100 (`DESIGN_MIN_SCORE`) from Muse Spark's rating. The art director and picture rater score by named visible defects, so a clean design can reach 90. A design that falls short is remade up to three times, each attempt told what the last got wrong (the last on a drawn backdrop), and the owner sees the reasons and an Improve button. Below the benchmark a post is flagged so it cannot be approved.
+- Video in the design studio: four scenes planned by Muse Spark and drawn by Muse Image (the owner's real photo opens and closes it when the product has one), lettered by the studio, every scene rated, the weakest scene decides the score. Posts to Facebook, Instagram, Telegram, TikTok or WhatsApp Status through the same approval queue. The owner can knowingly post a design that is below the benchmark; the post is marked that way in the approval queue. Run for real on the server: four scenes, score 92, 478 KB.
+- Payment claims: a customer who says they paid, or pastes the reference, is checked with Paystack by the server before the rep answers, so money that arrived is never answered with "pay through the link" again.
 - Scheduler (off by default): send queued messages, follow-ups, import leads from a Google Sheet, score each lead against the owner's ideal customer (Muse Spark Open on Baseten), draft emails for the fits, and make posts with flyers (and optional videos) for products not promoted lately. Nothing is sent or posted without the owner's approval.
 - Inventory from a Google Sheet that keeps everything: extra columns become notes, a row with no price is imported unlisted, delivery prices per named place, and cost and supplier columns are never copied.
 - Spending limits on expenses, set by the owner, enforced in code.
@@ -81,7 +83,7 @@ This repo contains no Meta logos, no Jolly, and no generated variations of eithe
 ## Known gaps
 
 - **The scheduler is built but off by default and has not run on the live server.** It is tested with fakes. The automatic content job and lead scoring have also never run end to end on the live server.
-- **The 90 quality benchmark is strict.** In real runs, flyers rated by Muse Spark scored 64 to 70, so at 90 most would be flagged for the owner to remake. The threshold is a server setting.
+- **The 90 quality benchmark can still be missed.** After the rating was made defect-based, one real flyer scored 90 on its first attempt and one real video scored 92, but this is one sample each. Some designs will fall short and show the owner what was found. The threshold is a server setting (`DESIGN_MIN_SCORE`).
 - **Video has no sound.** Meta has no speech or video model, so videos are Muse Image pictures with the script's words on screen.
 - **The live server uses a free address on one VM.** A custom domain and a second server are post-event work.
 - **Instagram and WhatsApp direct messages** are built but blocked by Meta's own gates, so the demo runs on Telegram and the web chat.

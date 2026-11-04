@@ -12,10 +12,11 @@ from ..models.base import Image, Message, ModelRequest
 MIN_SCORE = float(os.environ.get("DESIGN_MIN_SCORE", "90"))
 MAX_PICTURE_TRIES = 3
 
-PICTURE_SYSTEM = """You inspect one picture that a Nigerian business wants to post, as a product photo or as a frame of a short video. Be strict and calibrated.
-Score 0 to 100. 90 or more means a professional would publish it unchanged. Subtract for: warped, melted, duplicated or impossible objects; a product that is
-not clearly the subject; wrong or extra objects for the scene described; any text, letters, numbers, logos or watermarks inside the picture; people, hands
-or faces when none were asked for; dull light, clutter, awkward framing, bars or empty bands, low detail.
+PICTURE_SYSTEM = """You inspect one picture that a Nigerian business wants to post, as a product photo or as a frame of a short video. Score by concrete visible defects, not by taste.
+Start at 100 and subtract 25 for each serious defect: warped, melted, duplicated or impossible objects; a product that is not clearly the subject; wrong or
+extra objects for the scene described; any text, letters, numbers, logos or watermarks inside the picture; people, hands or faces when none were asked for.
+Subtract 8 for each minor defect: dull light, clutter, awkward framing, bars or empty bands, low detail. Do not subtract for style. A sharp, well-lit picture of
+the right subject with none of these defects is 90 to 100.
 Reply with JSON only: {"score": <0 to 100>, "issues": ["each visible defect, short and specific"]}"""
 
 

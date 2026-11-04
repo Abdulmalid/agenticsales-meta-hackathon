@@ -6,6 +6,7 @@ import { call } from "@/lib/client";
 import { naira } from "@/lib/format";
 import type { DesignResult, ViralPlatform } from "@/lib/types";
 
+const VIDEO_PLATFORMS = ["facebook", "instagram", "telegram", "tiktok", "whatsapp_status"];
 const FORMATS = [["ig_post", "Instagram or Facebook post"], ["ig_story", "Story, Reel or Status"], ["ig_square", "Square post"], ["fb_post", "Facebook link share"],
   ["flyer_a5", "Flyer, A5"], ["poster_a3", "Poster, A3"]] as const;
 
@@ -13,6 +14,7 @@ export function DesignStudio({ products, enabled }: { products: { sku: string; n
   const toast = useToast();
   const [request, setRequest] = useState("");
   const [format, setFormat] = useState<string>("ig_post");
+  const [kind, setKind] = useState<"image" | "video">("image");
   const [sku, setSku] = useState("");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<DesignResult | null>(null);
@@ -22,6 +24,7 @@ export function DesignStudio({ products, enabled }: { products: { sku: string; n
   const [caption, setCaption] = useState("");
   const [posting, setPosting] = useState(false);
   const [outcome, setOutcome] = useState<string[]>([]);
+  const [allowBelow, setAllowBelow] = useState(false);
 
   useEffect(() => {
     void call<ViralPlatform[]>("viral/platforms").then((r) => { if (r.ok) setPlatforms(r.data); });
@@ -32,7 +35,7 @@ export function DesignStudio({ products, enabled }: { products: { sku: string; n
     if (!result || chosen.length === 0) return;
     setPosting(true);
     setOutcome([]);
-    const made = await call<{ items: { id: number; platform_key: string; violations: string[] }[] }>(`design/jobs/${job}/items`, { method: "POST", body: { platforms: chosen, caption } });
+    const made = await call<{ items: { id: number; platform_key: string; violations: string[] }[] }>(`design/jobs/${job}/items`, { method: "POST", body: { platforms: chosen, caption, override: !result.passed } });
     if (!made.ok) { setPosting(false); return toast(made.error, "error"); }
     const lines: string[] = [];
     for (const it of made.data.items) {
@@ -48,11 +51,11 @@ export function DesignStudio({ products, enabled }: { products: { sku: string; n
     setPosting(false);
   }
 
-  async function go(e: React.FormEvent) {
-    e.preventDefault();
+  async function go(e: React.FormEvent | null, fix: string[] = []) {
+    e?.preventDefault();
     setBusy(true);
     setResult(null);
-    const started = await call<{ job: string }>("design", { method: "POST", body: { request, format, sku: sku || null } });
+    const started = await call<{ job: string }>(kind === "video" ? "design/video" : "design", { method: "POST", body: kind === "video" ? { request, sku: sku || null, fix } : { request, format, sku: sku || null, fix } });
     if (!started.ok) { setBusy(false); return toast(started.error, "error"); }
     setJob(started.data.job);
     setOutcome([]);
@@ -61,7 +64,7 @@ export function DesignStudio({ products, enabled }: { products: { sku: string; n
       await new Promise((ok) => setTimeout(ok, 3000));
       const j = await call<{ status: string; result?: DesignResult; error?: string }>(`design/jobs/${started.data.job}`);
       if (!j.ok) break;
-      if (j.data.status === "done" && j.data.result) { setBusy(false); setCaption(j.data.result.caption); return setResult(j.data.result); }
+      if (j.data.status === "done" && j.data.result) { setBusy(false); setCaption(j.data.result.caption); setAllowBelow(false); return setResult(j.data.result); }
       if (j.data.status === "error") { setBusy(false); return toast(j.data.error ?? "The design could not be made.", "error"); }
     }
     setBusy(false);
@@ -70,39 +73,55 @@ export function DesignStudio({ products, enabled }: { products: { sku: string; n
 
   const product = products.find((p) => p.sku === sku);
   return (
-    <form className="card stack" onSubmit={go} aria-labelledby="design-h">
+    <form className="card stack" onSubmit={(e) => void go(e)} aria-labelledby="design-h">
       <div>
         <h2 id="design-h">Design studio</h2>
         <p className="muted">A flyer, banner or post image with your words on it. Muse Image paints the picture, then your rep sets the lettering as sharp vector type, checks it and fixes what a phone screen would get wrong. Prices come from your catalogue.</p>
       </div>
       {!enabled && <Notice tone="warn">Your plan does not include image creation. Ask us to upgrade it.</Notice>}
+      <div className="row wrap" role="group" aria-label="What to make">
+        <button type="button" className={kind === "image" ? "btn primary" : "btn"} aria-pressed={kind === "image"} onClick={() => { setKind("image"); setResult(null); }}>Flyer or image</button>
+        <button type="button" className={kind === "video" ? "btn primary" : "btn"} aria-pressed={kind === "video"} onClick={() => { setKind("video"); setResult(null); setChosen([]); }}>Video</button>
+      </div>
       <div className="row wrap">
         <select value={sku} onChange={(e) => setSku(e.target.value)} aria-label="Product">
           <option value="">No product (use my description)</option>
           {products.map((p) => <option key={p.sku} value={p.sku}>{p.name} ({naira(p.price_kobo)})</option>)}
         </select>
-        <select value={format} onChange={(e) => setFormat(e.target.value)} aria-label="Size">
-          {FORMATS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
-        </select>
+        {kind === "image" && (
+          <select value={format} onChange={(e) => setFormat(e.target.value)} aria-label="Size">
+            {FORMATS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+          </select>
+        )}
       </div>
       <textarea rows={3} maxLength={600} required minLength={8} value={request} onChange={(e) => setRequest(e.target.value)} aria-label="What the design is for"
         placeholder={product ? `Anything to add? For example: weekend sale, free delivery in Lagos.` : "Describe it. For example: a flyer for our weekend phone sale, with free delivery in Lagos, order on WhatsApp."} />
       <div>
-        <button className="btn primary" disabled={busy || !enabled || request.trim().length < 8}>{busy ? "Designing… about two minutes, you can stay on this page" : "Create design"}</button>
+        <button className="btn primary" disabled={busy || !enabled || request.trim().length < 8}>{busy ? (kind === "video" ? "Making the video… a few minutes, you can stay on this page" : "Designing… up to three minutes, you can stay on this page") : kind === "video" ? "Create video" : "Create design"}</button>
       </div>
       {result && (
         <div className="stack">
-          <img src={result.image} alt={`Design: ${result.headline || "your request"}`} style={{ maxWidth: 420, width: "100%", borderRadius: 8, border: "1px solid var(--line)" }} />
+          {result.kind === "video" && result.video ? (
+            // eslint-disable-next-line jsx-a11y/media-has-caption
+            <video controls playsInline poster={result.image} src={result.video} style={{ maxWidth: 260, width: "100%", borderRadius: 8, border: "1px solid var(--line)" }} />
+          ) : (
+            <img src={result.image} alt={`Design: ${result.headline || "your request"}`} style={{ maxWidth: 420, width: "100%", borderRadius: 8, border: "1px solid var(--line)" }} />
+          )}
+          {result.kind === "video" && result.frames && (
+            <div className="row wrap">{result.frames.map((f, i) => <img key={i} src={f} alt={`Scene ${i + 1}`} style={{ width: 64, borderRadius: 4, border: "1px solid var(--line)" }} />)}</div>
+          )}
           <div className="row wrap small">
             <Badge tone={result.passed ? "ok" : "danger"}>{result.passed ? `Quality ${result.score}/100: passed` : result.checked ? `Quality ${result.score}/100: below the ${result.min_score} benchmark` : "Not checked by a model"}</Badge>
             <Badge tone="neutral">{result.brain ? "Muse Spark checked it" : "No AI model reachable: template layout"}</Badge>
-            <a className="btn sm ghost" href={result.image} download={result.file.replace(/\.png$/, ".jpg")}>Download instead</a>
+            {result.kind === "video" ? (result.video && <a className="btn sm ghost" href={result.video} download={result.file}>Download instead</a>)
+              : <a className="btn sm ghost" href={result.image} download={result.file.replace(/\.png$/, ".jpg")}>Download instead</a>}
           </div>
-          {result.passed ? (
+          {result.passed || allowBelow ? (
             <div className="stack">
               <strong>Post it</strong>
+              {!result.passed && <Notice tone="warn">Below the {result.min_score} benchmark (scored {result.score}). You chose to post it anyway; the post is marked that way in your approvals.</Notice>}
               <div className="row wrap">
-                {platforms.filter((p) => p.needs_media !== "video").map((p) => (
+                {platforms.filter((p) => (result.kind === "video" ? VIDEO_PLATFORMS.includes(p.key) : p.needs_media !== "video")).map((p) => (
                   <label key={p.key} className="check">
                     <input type="checkbox" checked={chosen.includes(p.key)} onChange={(e) => setChosen((c) => (e.target.checked ? [...c, p.key] : c.filter((k) => k !== p.key)))} />
                     {p.label} <span className="small muted">{p.publish === "ready" ? "posts automatically" : p.publish === "needs_setup" ? "needs connecting" : "you copy and post"}</span>
@@ -116,7 +135,13 @@ export function DesignStudio({ products, enabled }: { products: { sku: string; n
               </div>
               {outcome.map((l) => <p key={l} className="small">{l}</p>)}
             </div>
-          ) : <Notice tone="warn">This design did not reach the quality benchmark, so it cannot be posted. Press Create design to make it again.</Notice>}
+          ) : (
+            <div className="stack">
+              <Notice tone="warn">This {result.kind === "video" ? "video" : "design"} did not reach the {result.min_score} quality benchmark, so it cannot be posted yet. The rep can try again and fix what was found.</Notice>
+              {(result.improve ?? []).length > 0 && <ul className="small muted">{(result.improve ?? []).map((x) => <li key={x}>{x}</li>)}</ul>}
+              <div><button className="btn primary" type="button" disabled={busy} onClick={() => void go(null, result.improve ?? [])}>Improve it automatically</button>{" "}<button className="btn" type="button" disabled={busy} onClick={() => setAllowBelow(true)}>Post it anyway</button></div>
+            </div>
+          )}
           {result.asked.length > 0 && <Notice tone="info">The rep would like to know: {result.asked.join(" ")}</Notice>}
           {result.notes.length > 0 && <p className="small muted">{result.notes.join(" · ")}</p>}
         </div>

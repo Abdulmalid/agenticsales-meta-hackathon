@@ -69,7 +69,7 @@ index 87f7e5a..9199a45 100644
 +
 +The code is released under the MIT License (see `LICENSE`). Data under `data/corpora/` is not covered by it and keeps its own terms; see `data/corpora/NAIRALAND_PROVENANCE.md`.
 diff --git a/agentic_sales/agents/content.py b/agentic_sales/agents/content.py
-index 4de3878..98d1f49 100644
+index 4de3878..c20e003 100644
 --- a/agentic_sales/agents/content.py
 +++ b/agentic_sales/agents/content.py
 @@ -23,9 +23,10 @@ from pathlib import Path
@@ -118,7 +118,7 @@ index 4de3878..98d1f49 100644
              raise ContentError("; ".join(f"{k}: {v}" for k, v in out.failures.items()))
          return out
  
-+    def add_designed_post(self, pkey: str, caption: str, media: Path, *, price_kobo: int | None = None, product_sku: str | None = None, by: str = "design") -> dict:
++    def add_designed_post(self, pkey: str, caption: str, media: Path, *, price_kobo: int | None = None, product_sku: str | None = None, by: str = "design", note: str = "") -> dict:
 +        """A post made of a finished design (a flyer that met the benchmark) and a caption the owner wrote or accepted. It goes through the same
 +        checks as any post (no claims, no payment links, only prices from the catalogue or the design itself) and waits for approval like one."""
 +        plat = viral.PLATFORMS.get(pkey)
@@ -131,7 +131,7 @@ index 4de3878..98d1f49 100644
 +        status = "draft" if issues else "pending_approval"
 +        iid = self.store.add(campaign_id="design-" + uuid.uuid4().hex[:8], platform=plat.group, surface=pkey if plat.group == "meta" else None,
 +                             objective="conversion", status=status, violations=list(issues), advice=[], variant="A", product_sku=product_sku,
-+                             brief="Made in the design studio", media_path=str(media), **clean_post)
++                             brief="Made in the design studio." + note, media_path=str(media), **clean_post)
 +        return {"id": iid, "platform_key": pkey, "status": status, "violations": list(issues)}
 +
      def _smm(self, pkey: str, plat, query: str, objective: str) -> list[SmmGuidance]:
@@ -466,7 +466,7 @@ index 4de3878..98d1f49 100644
  class ContentError(RuntimeError):
      pass
 diff --git a/agentic_sales/agents/orchestrator.py b/agentic_sales/agents/orchestrator.py
-index 311276c..1208b00 100644
+index 311276c..2b686ed 100644
 --- a/agentic_sales/agents/orchestrator.py
 +++ b/agentic_sales/agents/orchestrator.py
 @@ -11,6 +11,7 @@ from __future__ import annotations
@@ -485,14 +485,15 @@ index 311276c..1208b00 100644
  from ..language.analysis import Signal, plan_style
  from ..language.analyzer import Analyzer
  from ..leads.engine import apply_turn
-@@ -33,12 +35,14 @@ from ..payments.paystack import PaymentGateway
+@@ -33,14 +35,17 @@ from ..payments.paystack import PaymentGateway
  from ..payments.service import PaymentService
  from ..policy.engine import PolicyEngine
  from ..security import untrusted
 +from ..language.humanize import humanize
 +from ..security import identity
  from ..security.reply_guard import amounts_kobo, check_claims, check_reply, customer_amounts_kobo
- from ..tools.commerce import register_commerce_tools
+-from ..tools.commerce import register_commerce_tools
++from ..tools.commerce import _verify as verify_payment_tool, register_commerce_tools
  from ..tools.registry import Status, ToolContext, ToolRegistry, TurnState
  from . import sales
  
@@ -500,8 +501,11 @@ index 311276c..1208b00 100644
 +SAFE_FALLBACK = "Let me check that properly and come back to you shortly."
  OPT_OUT_REPLY = "You've been unsubscribed and won't receive further messages from us. Reply START if you change your mind."
  _MAX_QTY_MULTIPLE = 50
++_PAY_REF = re.compile(r"(?<![A-Za-z0-9])AS-([0-9a-fA-F]{16})(?![0-9a-fA-F])")        # a payment reference this server issued
  _STOP = re.compile(r"^\s*(stop|unsubscribe|opt[ -]?out|stop messages|cancel messages)\s*[.!]*\s*$", re.I)
-@@ -56,26 +60,31 @@ class TurnResult:
+ _START = re.compile(r"^\s*(start|subscribe|opt[ -]?in)\s*[.!]*\s*$", re.I)
+ 
+@@ -56,26 +61,31 @@ class TurnResult:
      lead_score: int | None = None
      fraud_risk: str = "LOW"
      analysis_source: str = ""
@@ -536,7 +540,7 @@ index 311276c..1208b00 100644
          ckey = customer_key(msg.channel, msg.user_id)
          if not self.memory.first_time(msg.channel, msg.message_id):
              self.audit.record(trace, "duplicate_webhook_ignored", message_id=msg.message_id)
-@@ -91,16 +100,18 @@ class Orchestrator:
+@@ -91,26 +101,32 @@ class Orchestrator:
              self.memory.con.commit()
  
          flags = untrusted.injection_signals(text)
@@ -556,7 +560,22 @@ index 311276c..1208b00 100644
                            register=analysis.reading.primary.value, signals=[(s.name, s.evidence) for s in signals],
                            urgency=analysis.urgency, style={"slang": style.slang.name, "emoji": style.emoji,
                                                             "why": style.reasons})
-@@ -118,6 +129,13 @@ class Orchestrator:
+ 
++        # ---- a customer who says they have paid (or sends a reference) is checked with the gateway by the server, before the model answers
++        paid_turn, paid_note, paid_refs = self._check_payment(text, names, ckey, trace)
++
+         # ---- lead + fraud posture (before the model sees anything)
+         lead, _ = self.leads.get_or_create(ckey, msg.channel.value, msg.timestamp)
+         facts = self.memory.facts(ckey)
+         screenshot_only = bool(msg.attachments) and "payment_claim" in names
+         fraud = self._assess(names, flags, facts, lead, screenshot_only=screenshot_only,
+-                             pay=PaymentFacts(claimed="payment_claim" in names, screenshot_only=screenshot_only,
++                             pay=PaymentFacts(claimed="payment_claim" in names or bool(paid_refs), verified=paid_turn.payment_verified,
++                                              mismatch=paid_turn.payment_mismatch, has_reference=bool(paid_refs), screenshot_only=screenshot_only,
+                                               failed_attempts=self.payments.failed_attempts(ckey)))
+         lead, change, score = apply_turn(self.leads, lead, names, text, self.cfg, fraud_risk=fraud.risk.value,
+                                          trace=trace, now=msg.timestamp)
+@@ -118,12 +134,21 @@ class Orchestrator:
                            reasons=score.reasons, stage_change=(change.old.value, change.new.value, change.why) if change else None)
          self.audit.record(trace, "fraud", risk=fraud.risk.value, confidence=fraud.confidence, score=fraud.score,
                            families=fraud.families, reasons=fraud.reasons, action=fraud.recommended_action)
@@ -570,13 +589,21 @@ index 311276c..1208b00 100644
  
          history = self.memory.history(msg.conversation_id)
          self.memory.add_message(msg.conversation_id, ckey, "user", text)
-@@ -131,16 +149,19 @@ class Orchestrator:
+         reference = build_reference(self.corpus, text, analysis.reading, signals) if self.corpus else ""
+         frozen = lead.stage is LeadStage.FRAUD_SUSPECTED
+         turn = TurnState(restricted=fraud.requires_human or frozen)
++        turn.payment_verified, turn.payment_mismatch = paid_turn.payment_verified, paid_turn.payment_mismatch
++        turn.payment_claimed_unverified, turn.verified_amounts = paid_turn.payment_claimed_unverified, set(paid_turn.verified_amounts)
+         result = TurnResult("", trace, flags=flags, lead_stage=lead.stage.value, lead_score=score.value,
+                             fraud_risk=fraud.risk.value, analysis_source=analysis.source)
+         if fraud.requires_human:
+@@ -131,16 +156,19 @@ class Orchestrator:
              result.escalated = True
  
          system = sales.build_system(self.cfg, msg.channel.value, analysis.reading, signals, style, reference,
 -                                    self.tools, self.memory.facts(ckey), self._lead_context(lead, fraud, frozen), self.inventory)
 -        tctx = ToolContext(self.cfg, self.memory, self.policy, self.audit, trace, ckey, self.payments, self.leads, turn, inventory=self.inventory)
-+                                    self.tools, self.memory.facts(ckey), self._lead_context(lead, fraud, frozen), self.inventory, text)
++                                    self.tools, self.memory.facts(ckey), self._lead_context(lead, fraud, frozen) + paid_note, self.inventory, text)
 +        if len(text) > sales.LONG_MESSAGE_CHARS:
 +            system += sales.LONG_MESSAGE_RULE
 +        tctx = ToolContext(self.cfg, self.memory, self.policy, self.audit, trace, ckey, self.payments, self.leads, turn, inventory=self.inventory, photos=self.product_photos)
@@ -593,7 +620,7 @@ index 311276c..1208b00 100644
              if not plan.parse_ok:
                  return self._fallback(result, ckey, msg, "unparseable model output")
  
-@@ -188,19 +209,27 @@ class Orchestrator:
+@@ -188,19 +216,27 @@ class Orchestrator:
  
          def violations(text: str) -> list[str]:
              return (check_reply(text, allowed | turn.verified_amounts, payment_verified=turn.payment_verified)
@@ -625,15 +652,15 @@ index 311276c..1208b00 100644
                      plan, problems = retry, violations(retry.reply)
              except Exception as e:  # noqa: BLE001 - any failure here means: keep the failed draft -> human handoff
                  self.audit.record(trace, "reply_retry_failed", error=type(e).__name__)
-@@ -210,6 +239,7 @@ class Orchestrator:
+@@ -209,6 +245,7 @@ class Orchestrator:
+             return self._fallback(result, ckey, msg, "; ".join(problems) or "empty reply")
  
          result.reply = plan.reply
-         copied = longest_shared_run(plan.reply, reference) if reference else 0
 +        result.images = list(turn.images)
+         copied = longest_shared_run(plan.reply, reference) if reference else 0
          if copied >= 8:                                                  # repeating a corpus example word for word: advisory, tone should be borrowed not text
              result.flags.append("style:copied_example")
-             self.audit.record(trace, "style", copied_words=copied)
-@@ -218,7 +248,7 @@ class Orchestrator:
+@@ -218,7 +255,7 @@ class Orchestrator:
              result.flags.append("style:filler")
              self.audit.record(trace, "style", filler=stock)
          self.memory.add_message(msg.conversation_id, ckey, "assistant", plan.reply)
@@ -642,11 +669,43 @@ index 311276c..1208b00 100644
          return result
  
      # ------------------------------------------------------------------------------------------
-@@ -232,13 +262,15 @@ class Orchestrator:
+@@ -232,13 +269,47 @@ class Orchestrator:
              third_party_pickup=facts.get("third_party_pickup") == "yes", order_value_kobo=order_value,
              prior_verified_purchases=len(purchases)))
  
 -    def _escalate_fraud(self, trace: str, ckey: str, fraud: FraudAssessment) -> None:
++    def _check_payment(self, text: str, names: set[str], ckey: str, trace: str) -> tuple["TurnState", str, list[str]]:
++        """Ask the payment gateway about the references this customer gave, or, when they only say they have paid, about their latest unpaid order.
++        Only the gateway's answer counts (the same check the verify_payment tool makes); the result is handed to the model as a trusted line, so the
++        customer is never told to pay again for money that has arrived, and never told it arrived when it has not."""
++        found = [m.group(1).lower() for m in _PAY_REF.finditer(text)]
++        refs = list(dict.fromkeys("AS-" + h for h in found))[:3]
++        if not refs and "payment_claim" in names:
++            rows = self.memory.con.execute("SELECT reference FROM orders WHERE customer_key=? AND status='awaiting_payment' ORDER BY created DESC LIMIT 2", (ckey,)).fetchall()
++            refs = [r[0] for r in rows]
++        turn = TurnState()
++        ctx = ToolContext(self.cfg, self.memory, self.policy, self.audit, trace, ckey, self.payments, self.leads, turn, inventory=self.inventory)
++        lines = []
++        for ref in refs:
++            try:
++                res = verify_payment_tool(ctx, {"reference": ref})
++            except Exception:  # noqa: BLE001 - a check that fails must not take the conversation down
++                continue
++            status = str((res.data or {}).get("status") or res.status.value)
++            self.audit.record(trace, "payment_checked", reference=ref, status=status)
++            if status == "verified":
++                lines.append(f"Payment {ref} is VERIFIED by the payment gateway. Tell the customer plainly that their payment is confirmed and the order is being processed; "
++                             "delivery and tracking updates will follow. Do not ask them to pay again.")
++            elif status == "pending":
++                lines.append(f"Payment {ref}: the gateway has NOT received it yet. Say that it has not shown up yet, ask them to wait a minute and send the reference again, "
++                             "and to check that they paid through the payment link. Never say it is confirmed.")
++            elif status == "unknown":
++                lines.append(f"The reference {ref} was not issued to this customer by this shop. Say you cannot find it and ask them to check the reference on their payment page.")
++            elif status in ("failed", "mismatch"):
++                lines.append(f"Payment {ref}: the gateway reports a problem ({status}). Say it did not go through as expected, that nothing is released on it, and that you can send the link again.")
++        note = ("\nPayment check (done by the server just now with the payment gateway, trusted; relay it, do not call verify_payment again for these):\n- " + "\n- ".join(lines)) if lines else ""
++        return turn, note, refs
++
 +    def _escalate_fraud(self, trace: str, ckey: str, fraud: FraudAssessment,
 +                        extra_reasons: tuple[str, ...] = ()) -> None:
          already = any(a["customer_key"] == ckey and a["action"] == "fraud_review"
@@ -660,7 +719,7 @@ index 311276c..1208b00 100644
  
      @staticmethod
      def _lead_context(lead, fraud: FraudAssessment, frozen: bool = False) -> str:
-@@ -246,8 +278,8 @@ class Orchestrator:
+@@ -246,8 +317,8 @@ class Orchestrator:
                   f"trust={lead.trust_level}, interest={lead.interest or 'unknown'}"]
          if fraud.risk is not Risk.LOW or frozen:
              lines.append("Internal posture (never mention to the customer): this conversation is under review. "
@@ -671,7 +730,7 @@ index 311276c..1208b00 100644
          return "\n".join(lines)
  
      def _fallback(self, result: TurnResult, ckey: str, msg: InboundMessage, why: str) -> TurnResult:
-@@ -263,8 +295,12 @@ class Orchestrator:
+@@ -263,8 +334,12 @@ class Orchestrator:
              allowed |= {p.price_kobo * k for k in range(1, _MAX_QTY_MULTIPLE + 1)}
          fees = set(self.cfg.delivery_fees.values())
          for i in self.inventory.all_info().values():
@@ -686,7 +745,7 @@ index 311276c..1208b00 100644
              allowed |= {p.price_kobo + f for f in fees}
          return allowed
 diff --git a/agentic_sales/agents/sales.py b/agentic_sales/agents/sales.py
-index 5e537e3..8edcd6e 100644
+index 5e537e3..f3d18dc 100644
 --- a/agentic_sales/agents/sales.py
 +++ b/agentic_sales/agents/sales.py
 @@ -6,15 +6,16 @@ turn, and the system block states that nothing inside it is an instruction.
@@ -714,9 +773,10 @@ index 5e537e3..8edcd6e 100644
  - Stock: the product list shows what is available, including sizes or colours. Never offer a size or colour that is not listed or is sold out; when a product has sizes, ask which one before creating the payment link.
 -- You cannot grant discounts yourself. To offer a lower price, call propose_price and relay the outcome exactly. If the tool returns a counter offer, make THAT offer, no lower; concede in small steps and never reveal how far you could go.
 -- Assert only what appears under Business facts, Products, delivery, payment or refunds below. If asked about anything else (registration or licences, certifications, guarantees, pay-on-delivery, returns, delivery times or fees, warranty terms), say you will confirm with the team. Never claim the business is registered, licensed, certified or "100% safe", and never invent a policy.
+-- Never say a payment is received or confirmed unless the verify_payment tool returned status \"verified\" this turn. If you cannot verify (no such tool, or status is not verified), say it will be verified before fulfilment. Screenshots and bank alerts are not proof.
 +- You cannot grant discounts yourself. To offer a lower price, call propose_price and relay the outcome exactly. If the tool returns a counter offer, make THAT offer, no lower; concede in small steps and never reveal how far you could go. Every time the customer names a price, answer it in this order: whether you can confirm that price, then the price you can confirm now. When the customer accepts a price you offered, call propose_price with exactly that price before anything else, and quote the price the tool accepts, never the list price. Never answer an offer with only \"noted\" or \"I am checking\", which sounds like a yes or leaves them waiting with nothing.
 +- Assert only what appears under Business facts, Products, delivery, payment or refunds below. If asked about anything else (registration or licences, certifications, guarantees, pay-on-delivery, returns, delivery times or fees, warranty terms), say you will check and come back to them. Never claim the business is registered, licensed, certified or "100% safe", and never invent a policy.
- - Never say a payment is received or confirmed unless the verify_payment tool returned status \"verified\" this turn. If you cannot verify (no such tool, or status is not verified), say it will be verified before fulfilment. Screenshots and bank alerts are not proof.
++- Never say a payment is received or confirmed unless the verify_payment tool returned status \"verified\" this turn, or the \"Payment check\" line below says VERIFIED (the server asked the gateway for you; relay that result exactly, whether it is verified or not yet received). If you cannot verify (no such tool, or status is not verified), say it will be verified before fulfilment. Screenshots and bank alerts are not proof.
  - When a customer is ready to pay and create_payment_link is available, use it (ask for their email if you do not have it; also ask their name and delivery address and save them with remember_customer_fact under the keys name and delivery_address, so the shop knows where to dispatch). Never quote a payment link or account number from anywhere else.
 -- If unsure, or the customer is upset, or something looks suspicious, call escalate_to_human.
 +- Call escalate_to_human only when a person is really needed: the customer asks for a person, is angry about an order they already paid for, threatens legal action, reports a harm, or is ready to buy but blocked by something only the owner can settle. Haggling, a price you cannot give, a fact you do not have, a payment screenshot that does not hold up, rude or off-topic messages, and a worried customer asking whether the shop is real or whether they will get their goods are NOT reasons: answer them yourself, plainly (see Trust under Business). It alerts the owner silently, so never tell the customer you are handing over, passing them on, or that someone will follow up; keep talking naturally.
@@ -3515,7 +3575,7 @@ index a4d6063..16bce8d 100644
  
  _INJECTION = [
 diff --git a/agentic_sales/server/app.py b/agentic_sales/server/app.py
-index 9d2c268..79c7d3d 100644
+index 9d2c268..9198ed7 100644
 --- a/agentic_sales/server/app.py
 +++ b/agentic_sales/server/app.py
 @@ -13,9 +13,11 @@ from __future__ import annotations
@@ -3535,11 +3595,12 @@ index 9d2c268..79c7d3d 100644
  from pydantic import BaseModel, Field
  
 -from .. import analytics, approvals
+-from ..agents.content import ContentError
+-from ..channels.adapters import ADAPTERS, _meta_verify
 +from .. import analytics, approvals, history, shift
 +from ..inventory.store import parse_places, places_text
 +from ..books import OverLimit
- from ..agents.content import ContentError
--from ..channels.adapters import ADAPTERS, _meta_verify
++from ..agents.content import ContentAgent, ContentError
 +from ..channels.adapters import ADAPTERS, _meta_verify, delivery_failures, public_comments
  from ..channels.dispatch import encrypt_all
  from ..connect.http import ConnectError
@@ -3719,7 +3780,7 @@ index 9d2c268..79c7d3d 100644
  class SheetIn(BaseModel):
      url: str = Field(min_length=20, max_length=400)
  
-@@ -123,6 +247,17 @@ class PromoteIn(BaseModel):
+@@ -123,6 +247,25 @@ class PromoteIn(BaseModel):
      variants: int = Field(default=1, ge=1, le=3)
  
  
@@ -3727,17 +3788,25 @@ index 9d2c268..79c7d3d 100644
 +    request: str = Field(min_length=8, max_length=600)
 +    format: str = Field(default="ig_post", max_length=30)
 +    sku: str | None = Field(default=None, max_length=64)
++    fix: list[str] = Field(default_factory=list, max_length=8)        # what the last attempt got wrong, so this one can fix it
++
++
++class DesignVideoIn(BaseModel):
++    request: str = Field(min_length=8, max_length=600)
++    sku: str | None = Field(default=None, max_length=64)
++    fix: list[str] = Field(default_factory=list, max_length=8)
 +
 +
 +class DesignPostIn(BaseModel):
 +    platforms: list[str] = Field(min_length=1, max_length=5)
 +    caption: str = Field(min_length=1, max_length=2200)
++    override: bool = False              # the owner posts a design that is below the benchmark, knowingly; the post says so in the approval queue
 +
 +
  class SelectPageIn(BaseModel):
      page_id: str = Field(min_length=1, max_length=64)
  
-@@ -130,6 +265,16 @@ class SelectPageIn(BaseModel):
+@@ -130,6 +273,16 @@ class SelectPageIn(BaseModel):
  class NewKeyIn(BaseModel):
      role: str = Field(default="staff", pattern="^(admin|staff)$")
      label: str = Field(default="", max_length=80)
@@ -3754,7 +3823,7 @@ index 9d2c268..79c7d3d 100644
  
  
  class PlatformKeyIn(BaseModel):
-@@ -138,8 +283,11 @@ class PlatformKeyIn(BaseModel):
+@@ -138,8 +291,11 @@ class PlatformKeyIn(BaseModel):
  
  class ChatIn(BaseModel):
      user_id: str = Field(min_length=1, max_length=64, pattern=r"^[\w.@+-]+$")
@@ -3767,7 +3836,7 @@ index 9d2c268..79c7d3d 100644
  
  
  class DecisionIn(BaseModel):
-@@ -199,9 +347,17 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -199,9 +355,17 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
          runtimes = Runtimes(root, corpus)
      app = FastAPI(title="AgenticSales", version="0.1", docs_url=None, redoc_url=None)
      api_limit, hook_limit, public_limit = RateLimiter(240), RateLimiter(1200), RateLimiter(20)
@@ -3785,7 +3854,7 @@ index 9d2c268..79c7d3d 100644
      runtimes.gate = gate                                  # tenant runtimes enforce the monthly AI-reply allowance
      def client_ip(request: Request) -> str:
          return request.client.host if request.client else "?"
-@@ -232,6 +388,10 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -232,6 +396,10 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
              raise HTTPException(403, "admin role required")
          return p
  
@@ -3796,7 +3865,7 @@ index 9d2c268..79c7d3d 100644
      def operator(authorization: str | None = Header(default=None)) -> Principal:
          p = auth.authenticate(bearer(authorization))
          if p is None or not p.is_superadmin:
-@@ -242,6 +402,16 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -242,6 +410,16 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
      def rt_of(p: Principal = Depends(principal)) -> TenantRuntime:
          return runtimes.get(p.tenant_id)
  
@@ -3813,7 +3882,7 @@ index 9d2c268..79c7d3d 100644
      def tenant_or_404(tenant_id: str) -> TenantRuntime:
          if not TENANT_ID.fullmatch(tenant_id) or not auth.tenant_active(tenant_id):
              raise HTTPException(404, "not found")      # unknown and suspended businesses look the same from outside
-@@ -264,11 +434,12 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -264,11 +442,12 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
      @app.post("/webhooks/{tenant_id}/paystack")
      async def paystack_webhook(tenant_id: str, request: Request, bg: BackgroundTasks) -> dict:
          rt = tenant_or_404(tenant_id)
@@ -3827,7 +3896,7 @@ index 9d2c268..79c7d3d 100644
          event = json.loads(raw)
          ref = (event.get("data") or {}).get("reference")
          if event.get("event") == "charge.success" and isinstance(ref, str):
-@@ -282,7 +453,7 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -282,7 +461,7 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
      @app.post("/webhooks/{tenant_id}/{channel}")
      async def webhook(tenant_id: str, channel: str, request: Request, bg: BackgroundTasks) -> dict:
          rt = tenant_or_404(tenant_id)
@@ -3836,7 +3905,7 @@ index 9d2c268..79c7d3d 100644
          adapter = ADAPTERS.get(channel)
          if adapter is None:
              raise HTTPException(404, "unknown channel")
-@@ -294,10 +465,15 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -294,10 +473,15 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
              with rt.lock:
                  rt.orchestrator.audit.record("webhook", "webhook_rejected", channel=channel)
              raise HTTPException(401, "bad signature")
@@ -3852,7 +3921,7 @@ index 9d2c268..79c7d3d 100644
          for m in adapter.parse(payload, secrets):
              bg.add_task(rt.handle_and_reply, m)
          return {"ok": True}
-@@ -322,6 +498,7 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -322,6 +506,7 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
              raise HTTPException(422, "valid phone number required")
          with rt.lock:
              lead, _ = rt.orchestrator.leads.get_or_create(customer_key(Channel.WHATSAPP, phone), "landing_page")
@@ -3860,7 +3929,7 @@ index 9d2c268..79c7d3d 100644
              lead.name = (f.get("name") or "")[:80] or lead.name
              if f.get("sku") and rt.cfg.product(f["sku"]):
                  lead.interest = f["sku"]
-@@ -330,18 +507,133 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -330,18 +515,133 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
              rt.orchestrator.leads.event(lead.id, "landing_form", {"message": (f.get("message") or "")[:500]})
          return thanks
  
@@ -3996,7 +4065,7 @@ index 9d2c268..79c7d3d 100644
      @app.get("/sites/{tenant_id}", response_class=HTMLResponse)
      def site(tenant_id: str) -> HTMLResponse:
          rt = tenant_or_404(tenant_id)
-@@ -355,13 +647,15 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -355,13 +655,15 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
      def me(p: Principal = Depends(principal), rt: TenantRuntime = Depends(rt_of)) -> dict:
          return {"tenant_id": p.tenant_id, "role": p.role, "business_name": rt.cfg.business_name,
                  "key_label": p.label, "plan": gate.plan(p.tenant_id).label,
@@ -4013,7 +4082,7 @@ index 9d2c268..79c7d3d 100644
  
      # ---- "Connect your account" (OAuth) ---------------------------------------------------------------------------
      def public_connection(c: dict) -> dict:
-@@ -375,10 +669,170 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -375,10 +677,170 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
      def connect_connections(p: Principal = Depends(principal)) -> list[dict]:
          return [public_connection(c) for c in auth.connections.list(p.tenant_id)]
  
@@ -4184,7 +4253,7 @@ index 9d2c268..79c7d3d 100644
          try:
              return {"url": connect.start(p.tenant_id, provider)}
          except ConnectUnavailable as e:
-@@ -418,37 +872,64 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -418,37 +880,64 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
      @app.get("/webhooks/meta")
      def meta_handshake(request: Request) -> Response:
          """The one webhook URL registered on our Meta app; events are routed to businesses by Page / Instagram account id."""
@@ -4257,7 +4326,7 @@ index 9d2c268..79c7d3d 100644
          return {"ok": True}
  
      @app.get("/v1/plan")
-@@ -466,10 +947,36 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -466,10 +955,36 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
      # ---- conversations ----------------------------------------------------------------------
      @app.post("/v1/chat")
      def chat(body: ChatIn, rt: TenantRuntime = Depends(rt_of)) -> dict:
@@ -4297,7 +4366,7 @@ index 9d2c268..79c7d3d 100644
  
      @app.get("/v1/audit/{trace}")
      def audit_trace(trace: str, rt: TenantRuntime = Depends(rt_of)) -> list[dict]:
-@@ -512,9 +1019,12 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -512,9 +1027,12 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
      @app.post("/v1/approvals/{approval_id}/decision")
      def decide(approval_id: int, body: DecisionIn, p: Principal = Depends(principal),
                 rt: TenantRuntime = Depends(rt_of)) -> dict:
@@ -4311,7 +4380,7 @@ index 9d2c268..79c7d3d 100644
          if not d.ok:
              raise HTTPException(409 if "already" in d.detail else 422, d.detail)
          return {"detail": d.detail}
-@@ -528,7 +1038,9 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -528,7 +1046,9 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
          gate.require(p.tenant_id, "followups", "Automatic follow-ups")
          with rt.lock:
              stale = retention.mark_stale_leads(rt.orchestrator.leads)
@@ -4322,7 +4391,7 @@ index 9d2c268..79c7d3d 100644
          return {"stale": stale, "followups": rep.__dict__}
  
      # ---- content / SMM -----------------------------------------------------------------------
-@@ -553,13 +1065,13 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -553,13 +1073,13 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
  
      @app.post("/v1/content/{item_id}/approve")
      def content_approve(item_id: int, p: Principal = Depends(principal), rt: TenantRuntime = Depends(rt_of)) -> dict:
@@ -4338,7 +4407,7 @@ index 9d2c268..79c7d3d 100644
              raise HTTPException(409, "cannot reject")
          return {"status": "rejected"}
  
-@@ -572,30 +1084,141 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -572,30 +1092,167 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
          return {"violations": issues, "status": "draft" if issues else "pending_approval"}
  
      @app.post("/v1/content/{item_id}/schedule")
@@ -4378,10 +4447,32 @@ index 9d2c268..79c7d3d 100644
 +        gate.consume(p.tenant_id, "images", 1, what="designs")
 +        try:
 +            job = design_jobs.start(p.tenant_id, lambda: design.make(rt.orchestrator.router, rt.cfg, rt.content.media_dir / "designs", body.request, body.format, body.sku,
-+                                                            rt.content.product_image(body.sku) if body.sku else None),
++                                                            rt.content.product_image(body.sku) if body.sku else None, body.fix),
 +                                    lambda: gate.refund(p.tenant_id, "images", 1))
 +        except design.DesignError as e:
 +            gate.refund(p.tenant_id, "images", 1)
++            raise HTTPException(429, str(e)) from None
++        return {"job": job}
++
++    VIDEO_CREDITS = 3
++
++    @app.post("/v1/design/video")
++    def design_video(body: DesignVideoIn, p: Principal = Depends(principal), rt: TenantRuntime = Depends(rt_of)) -> dict:
++        """A short silent vertical video made in the design studio: four scenes drawn by Muse Image (the owner's real photo opens and closes it), the studio's
++        lettering, ffmpeg to join them, every scene rated against the quality benchmark. Runs in the background like a flyer."""
++        gate.require(p.tenant_id, "image_generation", "Design studio video")
++        problem = design.available()
++        if problem:
++            raise HTTPException(422, problem)
++        if body.sku and rt.cfg.product(body.sku) is None:
++            raise HTTPException(422, "That product is not in your catalogue.")
++        gate.consume(p.tenant_id, "images", VIDEO_CREDITS, what="design videos")
++        try:
++            job = design_jobs.start(p.tenant_id, lambda: design.make_video(rt.orchestrator.router, rt.cfg, rt.content.media_dir / "designs", body.request, body.sku,
++                                                                 rt.content.product_image(body.sku) if body.sku else None, body.fix),
++                                    lambda: gate.refund(p.tenant_id, "images", VIDEO_CREDITS))
++        except design.DesignError as e:
++            gate.refund(p.tenant_id, "images", VIDEO_CREDITS)
 +            raise HTTPException(429, str(e)) from None
 +        return {"job": job}
 +
@@ -4392,16 +4483,20 @@ index 9d2c268..79c7d3d 100644
 +        if j is None or j["status"] != "done":
 +            raise HTTPException(404, "no finished design with that id (it may have expired)")
 +        r = j["result"]
-+        if not r.get("passed"):
++        if not r.get("passed") and not body.override:
 +            raise HTTPException(409, f"This design scored {r.get('score')}, below the {r.get('min_score')} quality benchmark, so it cannot be posted. Make it again.")
 +        platforms = list(dict.fromkeys(body.platforms))
 +        if any(k not in viral.PLATFORMS for k in platforms):
 +            raise HTTPException(422, "Unknown platform.")
-+        media = rt.content.media_dir / "designs" / re.sub(r"\.png$", ".jpg", r["file"])
++        video = r.get("kind") == "video"
++        if video and any(k not in ContentAgent.REEL_PLATFORMS for k in platforms):
++            raise HTTPException(422, "A video can be posted to Facebook, Instagram, Telegram, TikTok and WhatsApp Status.")
++        media = rt.content.media_dir / "designs" / (r["file"] if video else re.sub(r"\.png$", ".jpg", r["file"]))
 +        out = []
 +        for k in platforms:
 +            try:
-+                out.append(rt.content.add_designed_post(k, body.caption, media, price_kobo=r.get("price_kobo"), by=who(p)))
++                out.append(rt.content.add_designed_post(k, body.caption, media, price_kobo=r.get("price_kobo"), by=who(p),
++                                                    note="" if r.get("passed") else f" Posted below the quality benchmark by the owner's choice (scored {r.get('score')} of {r.get('min_score')})."))
 +            except ContentError as e:
 +                raise HTTPException(422, str(e)) from None
 +        return {"items": out}
@@ -4486,7 +4581,7 @@ index 9d2c268..79c7d3d 100644
  
      # ---- products and "post this product everywhere" ---------------------------------------------------
      def new_sku(rt: TenantRuntime, name: str) -> str:
-@@ -640,6 +1263,40 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -640,6 +1297,40 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
              raise HTTPException(422, str(e)) from None
          return {"ok": True}
  
@@ -4527,7 +4622,7 @@ index 9d2c268..79c7d3d 100644
      @app.get("/v1/products/{sku}/image")
      def product_image_get(sku: str, rt: TenantRuntime = Depends(rt_of)) -> Response:
          path = rt.content.product_image(sku)
-@@ -652,16 +1309,71 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -652,16 +1343,71 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
      def stock_row(rt: TenantRuntime, p, sheet_skus: set[str]) -> dict:
          i = rt.inventory.info(p.sku)
          return {"sku": p.sku, "name": p.name, "price_kobo": p.price_kobo, "in_stock": p.in_stock, "description": p.description,
@@ -4605,7 +4700,7 @@ index 9d2c268..79c7d3d 100644
  
      # (registered before /{sku}: the fixed path must win)
      @app.put("/v1/inventory/sheet")
-@@ -679,19 +1391,28 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -679,19 +1425,28 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
          if product is None:
              raise HTTPException(404, "unknown product")
          fields = body.model_fields_set
@@ -4640,7 +4735,7 @@ index 9d2c268..79c7d3d 100644
              if fields & {"name", "price_kobo", "in_stock"}:
                  if body.name is not None:
                      product.name = body.name.strip()
-@@ -713,7 +1434,7 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -713,7 +1468,7 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
              raise HTTPException(422, "delta must not be 0")
          try:
              with rt.lock:
@@ -4649,7 +4744,7 @@ index 9d2c268..79c7d3d 100644
          except ValueError as e:
              raise HTTPException(422, str(e)) from None
          return {"sku": sku, "variant": body.variant, "quantity": new}
-@@ -767,16 +1488,96 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -767,16 +1522,96 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
              out.append({"reference": o["reference"], "sku": o["sku"], "product": names.get(o["sku"], o["sku"]), "variant": o["variant"],
                          "qty": o["qty"], "amount_kobo": o["amount_kobo"], "status": o["status"], "created": o["created"],
                          "paid_at": o["paid_at"], "customer_key": o["customer_key"], "customer_name": facts.get("name", ""),
@@ -4658,8 +4753,8 @@ index 9d2c268..79c7d3d 100644
 +                        "delivery": rt.orchestrator.payments.delivery.where(o), "track_url": rt.orchestrator.payments.track_url(o["reference"]),
 +                        "paid_kobo": o["paid_kobo"], "receipt_url": rt.orchestrator.payments.receipt_url(o["reference"]) if o["status"] in ("paid", "paid_oversold") else None,
 +                        "invoice_url": f"{rt.orchestrator.payments.receipt_base.rsplit('/receipt/', 1)[0]}/invoice/{rt.ctx.tenant_id}/{o['reference']}" if rt.orchestrator.payments.receipt_base else None})
-         return out
- 
++        return out
++
 +    @app.get("/v1/growth/segments")
 +    def growth_segments(rt: TenantRuntime = Depends(rt_of)) -> dict:
 +        """The last 'ideal customers' suggestions for this shop (or none yet)."""
@@ -4680,8 +4775,8 @@ index 9d2c268..79c7d3d 100644
 +            raise HTTPException(502, "the AI could not suggest customers just now, please try again") from e
 +        out = {"segments": segments, "made": datetime.now(timezone.utc).isoformat(), "basis": "an estimate from your catalogue, not measured demand"}
 +        rt.inventory.put_setting("growth_segments", out)
-+        return out
-+
+         return out
+ 
 +    @app.get("/v1/books")
 +    def books_summary(rt: TenantRuntime = Depends(books_reader)) -> dict:
 +        """Money in (confirmed by the gateway), money out (what the owner logged) and profit, for today, this week and this month, plus recent expenses."""
@@ -4748,7 +4843,7 @@ index 9d2c268..79c7d3d 100644
                  if body.notify:
                      rt.flush()
              return out
-@@ -802,7 +1603,7 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -802,7 +1637,7 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
          gate.consume(p.tenant_id, "content_posts", len(platforms) * variants, what="social posts")
          try:
              res = rt.content.plan_product(sku, platforms, body.objective, angle=body.angle, variants=variants,
@@ -4757,7 +4852,7 @@ index 9d2c268..79c7d3d 100644
          except ValueError as e:
              gate.refund(p.tenant_id, "content_posts", len(platforms) * variants)
              raise HTTPException(422, str(e)) from None
-@@ -815,7 +1616,34 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -815,7 +1650,34 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
                  "learned": res.learned, "variants_used": variants}
  
      @app.post("/v1/content/{item_id}/publish")
@@ -4793,7 +4888,7 @@ index 9d2c268..79c7d3d 100644
          try:
              ref = rt.content.publish_now(item_id, rt.credentials, rt.base_url, rt.ctx.tenant_id)
          except ContentError as e:
-@@ -823,13 +1651,13 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -823,13 +1685,13 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
          return {"status": "published", "ref": ref}
  
      @app.post("/v1/content/{item_id}/mark-posted")
@@ -4810,7 +4905,7 @@ index 9d2c268..79c7d3d 100644
          return rt.content.publish_due(rt.credentials, base_url=rt.base_url, tenant_id=rt.ctx.tenant_id)
  
      # ---- landing page --------------------------------------------------------------------------
-@@ -837,7 +1665,7 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -837,7 +1699,7 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
      def landing(body: LandingIn, p: Principal = Depends(admin), rt: TenantRuntime = Depends(rt_of)) -> dict:
          gate.require(p.tenant_id, "landing_page", "The landing page")
          try:
@@ -4819,7 +4914,7 @@ index 9d2c268..79c7d3d 100644
          except LandingError as e:
              raise HTTPException(422, str(e)) from None
          out = rt.root / "tenants" / p.tenant_id / "site" / "index.html"
-@@ -846,6 +1674,17 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -846,6 +1708,17 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
          return {"url_path": f"/sites/{p.tenant_id}", "bytes": len(page)}
  
      # ---- analytics ---------------------------------------------------------------------------
@@ -4837,7 +4932,7 @@ index 9d2c268..79c7d3d 100644
      @app.get("/v1/analytics/funnel")
      def funnel(rt: TenantRuntime = Depends(rt_of)) -> dict:
          return analytics.funnel(rt.orchestrator.leads)
-@@ -902,10 +1741,13 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -902,10 +1775,13 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
          out = {}
          for pid, (label, _) in PROVIDER_INFO.items():
              configured = pid in providers
@@ -4855,7 +4950,7 @@ index 9d2c268..79c7d3d 100644
          return out
  
      @app.get("/admin/me")
-@@ -953,9 +1795,9 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
+@@ -953,9 +1829,9 @@ def create_app(root: Path | None = None, runtimes: Runtimes | None = None, auth:
      def admin_issue_key(tenant_id: str, body: NewKeyIn, p: Principal = Depends(operator)) -> dict:
          tenant_row(tenant_id)
          gate.require_count(tenant_id, "business_keys", auth.active_key_count(tenant_id) + 1, "active keys")
@@ -5710,7 +5805,7 @@ index 8690467..271aaf1 100644
 +# LEGAL_ENTITY=
 +# LEGAL_CONTACT_EMAIL=
 diff --git a/docs/API.md b/docs/API.md
-index bfeb13c..41dc548 100644
+index bfeb13c..1dce142 100644
 --- a/docs/API.md
 +++ b/docs/API.md
 @@ -62,12 +62,15 @@ Roles: **any** = admin or staff; **admin** = admin only.
@@ -5780,7 +5875,7 @@ index bfeb13c..41dc548 100644
  ```
  `objective` is one of `awareness, consideration, engagement, lead_generation, conversion, retention, trust_building`. `variants` (1-3) is capped by the plan; platforms per call too (422 over the cap). Returns `{run_id, sku, items:[ContentItem], strategies:{platform: "..."}, failures:{platform: "reason"}, learned:[...], variants_used}`. Each platform's posts are separate campaigns (`<run_id>-ig|fb|tt|x|wa`) with versions `A/B/C` testing different hook patterns. Posts that fail the safety lint (invented prices, payment links, health or regulatory claims, engagement bait, unstated urgency, X's 280 characters) come back as `status: "draft"` with `violations`; the rest are `pending_approval`. Platforms that fail to generate are listed in `failures` and **not charged**. Takes 10-60 s.
  
-+`GET /v1/design/formats` (any) → `{formats: [{name, w, h, note}], problem}`. `POST /v1/design` (any; plans with image creation, one image credit) `{request: 8-600 chars, format?: "ig_post", sku?}` → `{job}`: the design takes one to three minutes, so it is made in the background. `POST /v1/design/jobs/{job}/items` (owner, or staff the owner allowed to publish) `{platforms: ["instagram", ...], caption}` → `{items: [{id, platform_key, status, violations}]}`: turns a finished design into posts in the approval queue, with the same checks as any post. `409` unless the design met the quality benchmark (`min_score`, 90 unless the server sets `DESIGN_MIN_SCORE`). Then `POST /v1/content/{id}/approve` and `/publish` post them. `GET /v1/design/jobs/{job}` → `{status: "working"|"done"|"error", result?: {image: data-URI JPEG, score, summary, notes, issues, art, brain, asked, price, headline, file}, error?}`; the credit is given back when a job fails. With `sku` the headline and price are the catalogue's own. `422` for an unknown product or format, `429` with too many designs in progress.
++`GET /v1/design/formats` (any) → `{formats: [{name, w, h, note}], problem}`. `POST /v1/design` (any; plans with image creation, one image credit) `{request: 8-600 chars, format?: "ig_post", sku?}` → `{job}`: the design takes one to three minutes, so it is made in the background. `POST /v1/design/jobs/{job}/items` (owner, or staff the owner allowed to publish) `{platforms: ["instagram", ...], caption}` → `{items: [{id, platform_key, status, violations}]}`: turns a finished design into posts in the approval queue, with the same checks as any post. `409` unless the design met the quality benchmark (`min_score`, 90 unless the server sets `DESIGN_MIN_SCORE`). Then `POST /v1/content/{id}/approve` and `/publish` post them. `GET /v1/design/jobs/{job}` → `{status: "working"|"done"|"error", result?: {image: data-URI JPEG, score, summary, notes, issues, art, brain, asked, price, headline, file}, error?}`; the credit is given back when a job fails. With `sku` the headline and price are the catalogue's own. `422` for an unknown product or format, `429` with too many designs in progress. `POST /v1/design` also takes `fix: [string]` (what the last attempt got wrong; the studio makes up to three designs, learning from each, the last on a drawn backdrop, and keeps the best). The result carries `improve` (what was found wrong when it is below the benchmark) and `kind: "image"`. `POST /v1/design/video` (any; three image credits) `{request, sku?, fix?}` → `{job}`: a four-scene silent video drawn by Muse Image (the owner's real photo opens and closes it when the product has one), lettered by the studio, every scene rated, the score being the weakest scene. The finished job has `kind: "video"`, `video` (data-URI, only when small), `frames`, and the same fields as an image; `/items` posts it to Facebook, Instagram, Telegram, TikTok or WhatsApp Status with the same benchmark rule.
 +
  `POST /v1/content/plan` (any). A custom campaign not tied to a product: `{brief, platform: "meta"|"tiktok"|"x", objective, surface?, n_posts: 1-5, want_video?}` → `{campaign_id, item_ids, strategy, violations, guidance_used, guidance_cautions, relaxed_filters}`.
  
@@ -5924,7 +6019,7 @@ index 9bdd989..9affbc8 100644
  
  The operator console's home page shows, per provider, whether the app is configured and the exact redirect URI, webhook URL and verify token to register. Check with `GET /v1/connect/providers` (a business key) after setting the variables.
 diff --git a/docs/openapi.json b/docs/openapi.json
-index 1c8fa03..774d60d 100644
+index 1c8fa03..009920f 100644
 --- a/docs/openapi.json
 +++ b/docs/openapi.json
 @@ -34,6 +34,57 @@
@@ -6050,7 +6145,7 @@ index 1c8fa03..774d60d 100644
      ],
      "title": "ChatIn",
      "type": "object"
-@@ -154,6 +241,101 @@
+@@ -154,6 +241,144 @@
      "title": "DecisionIn",
      "type": "object"
     },
@@ -6093,6 +6188,14 @@ index 1c8fa03..774d60d 100644
 +   },
 +   "DesignIn": {
 +    "properties": {
++     "fix": {
++      "items": {
++       "type": "string"
++      },
++      "maxItems": 8,
++      "title": "Fix",
++      "type": "array"
++     },
 +     "format": {
 +      "default": "ig_post",
 +      "maxLength": 30,
@@ -6149,10 +6252,45 @@ index 1c8fa03..774d60d 100644
 +    "title": "DesignPostIn",
 +    "type": "object"
 +   },
++   "DesignVideoIn": {
++    "properties": {
++     "fix": {
++      "items": {
++       "type": "string"
++      },
++      "maxItems": 8,
++      "title": "Fix",
++      "type": "array"
++     },
++     "request": {
++      "maxLength": 600,
++      "minLength": 8,
++      "title": "Request",
++      "type": "string"
++     },
++     "sku": {
++      "anyOf": [
++       {
++        "maxLength": 64,
++        "type": "string"
++       },
++       {
++        "type": "null"
++       }
++      ],
++      "title": "Sku"
++     }
++    },
++    "required": [
++     "request"
++    ],
++    "title": "DesignVideoIn",
++    "type": "object"
++   },
     "EditIn": {
      "properties": {
       "caption": {
-@@ -169,6 +351,44 @@
+@@ -169,6 +394,44 @@
      "title": "EditIn",
      "type": "object"
     },
@@ -6197,7 +6335,7 @@ index 1c8fa03..774d60d 100644
     "HTTPValidationError": {
      "properties": {
       "detail": {
-@@ -182,6 +402,51 @@
+@@ -182,6 +445,51 @@
      "title": "HTTPValidationError",
      "type": "object"
     },
@@ -6249,17 +6387,21 @@ index 1c8fa03..774d60d 100644
     "LandingIn": {
      "properties": {
       "accent_color": {
-@@ -284,6 +549,53 @@
+@@ -284,22 +592,69 @@
      "title": "LandingIn",
      "type": "object"
     },
+-   "MetricsIn": {
 +   "LedgerIn": {
-+    "properties": {
+     "properties": {
+-     "campaign_id": {
+-      "maxLength": 40,
+-      "title": "Campaign Id",
 +     "data": {
 +      "maxLength": 2900000,
 +      "minLength": 100,
 +      "title": "Data",
-+      "type": "string"
+       "type": "string"
 +     }
 +    },
 +    "required": [
@@ -6282,7 +6424,16 @@ index 1c8fa03..774d60d 100644
 +       }
 +      ],
 +      "title": "Daily Kobo"
-+     },
+      },
+-     "clicks": {
+-      "default": 0,
+-      "minimum": 0.0,
+-      "title": "Clicks",
+-      "type": "integer"
+-     },
+-     "conversions": {
+-      "default": 0,
+-      "minimum": 0.0,
 +     "per_expense_kobo": {
 +      "anyOf": [
 +       {
@@ -6300,10 +6451,26 @@ index 1c8fa03..774d60d 100644
 +    "title": "LimitsIn",
 +    "type": "object"
 +   },
-    "MetricsIn": {
-     "properties": {
-      "campaign_id": {
-@@ -336,6 +648,19 @@
++   "MetricsIn": {
++    "properties": {
++     "campaign_id": {
++      "maxLength": 40,
++      "title": "Campaign Id",
++      "type": "string"
++     },
++     "clicks": {
++      "default": 0,
++      "minimum": 0.0,
++      "title": "Clicks",
++      "type": "integer"
++     },
++     "conversions": {
++      "default": 0,
++      "minimum": 0.0,
+       "title": "Conversions",
+       "type": "integer"
+      },
+@@ -336,6 +691,19 @@
     },
     "NewKeyIn": {
      "properties": {
@@ -6323,17 +6490,12 @@ index 1c8fa03..774d60d 100644
       "label": {
        "default": "",
        "maxLength": 80,
-@@ -393,16 +718,138 @@
+@@ -393,6 +761,128 @@
      "title": "NewTenantIn",
      "type": "object"
     },
--   "PlanChangeIn": {
 +   "OutreachApproveIn": {
-     "properties": {
--     "plan": {
--      "pattern": "^(starter|growth|scale)$",
--      "title": "Plan",
--      "type": "string"
++    "properties": {
 +     "ids": {
 +      "anyOf": [
 +       {
@@ -6348,10 +6510,8 @@ index 1c8fa03..774d60d 100644
 +       }
 +      ],
 +      "title": "Ids"
-      }
-     },
--    "required": [
--     "plan"
++     }
++    },
 +    "title": "OutreachApproveIn",
 +    "type": "object"
 +   },
@@ -6456,20 +6616,10 @@ index 1c8fa03..774d60d 100644
 +    "title": "OutreachImportIn",
 +    "type": "object"
 +   },
-+   "PlanChangeIn": {
-+    "properties": {
-+     "plan": {
-+      "pattern": "^(starter|growth|scale)$",
-+      "title": "Plan",
-+      "type": "string"
-+     }
-+    },
-+    "required": [
-+     "plan"
-     ],
-     "title": "PlanChangeIn",
-     "type": "object"
-@@ -592,6 +1039,18 @@
+    "PlanChangeIn": {
+     "properties": {
+      "plan": {
+@@ -592,6 +1082,18 @@
        ],
        "title": "Fee Other Kobo"
       },
@@ -6488,7 +6638,7 @@ index 1c8fa03..774d60d 100644
       "in_stock": {
        "anyOf": [
         {
-@@ -667,6 +1126,65 @@
+@@ -667,6 +1169,65 @@
      "title": "StockIn",
      "type": "object"
     },
@@ -6554,7 +6704,7 @@ index 1c8fa03..774d60d 100644
     "ValidationError": {
      "properties": {
       "ctx": {
-@@ -706,6 +1224,21 @@
+@@ -706,6 +1267,21 @@
      ],
      "title": "ValidationError",
      "type": "object"
@@ -6576,10 +6726,881 @@ index 1c8fa03..774d60d 100644
     }
    },
    "securitySchemes": {
-@@ -1842,6 +2375,62 @@
-     "summary": "Public Media"
-    }
-   },
+@@ -974,9 +1550,2576 @@
+       "content": {
+        "application/json": {
+         "schema": {
+-         "additionalProperties": true,
+-         "title": "Response Admin Me Admin Me Get",
+-         "type": "object"
++         "additionalProperties": true,
++         "title": "Response Admin Me Admin Me Get",
++         "type": "object"
++        }
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
++    "summary": "Admin Me"
++   }
++  },
++  "/admin/overview": {
++   "get": {
++    "operationId": "admin_overview_admin_overview_get",
++    "parameters": [
++     {
++      "in": "header",
++      "name": "authorization",
++      "required": false,
++      "schema": {
++       "anyOf": [
++        {
++         "type": "string"
++        },
++        {
++         "type": "null"
++        }
++       ],
++       "title": "Authorization"
++      }
++     }
++    ],
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "additionalProperties": true,
++         "title": "Response Admin Overview Admin Overview Get",
++         "type": "object"
++        }
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
++    "summary": "Admin Overview"
++   }
++  },
++  "/admin/plans": {
++   "get": {
++    "operationId": "admin_plans_admin_plans_get",
++    "parameters": [
++     {
++      "in": "header",
++      "name": "authorization",
++      "required": false,
++      "schema": {
++       "anyOf": [
++        {
++         "type": "string"
++        },
++        {
++         "type": "null"
++        }
++       ],
++       "title": "Authorization"
++      }
++     }
++    ],
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "items": {
++          "additionalProperties": true,
++          "type": "object"
++         },
++         "title": "Response Admin Plans Admin Plans Get",
++         "type": "array"
++        }
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
++    "summary": "Admin Plans"
++   }
++  },
++  "/admin/tenants": {
++   "post": {
++    "operationId": "admin_create_tenant_admin_tenants_post",
++    "parameters": [
++     {
++      "in": "header",
++      "name": "authorization",
++      "required": false,
++      "schema": {
++       "anyOf": [
++        {
++         "type": "string"
++        },
++        {
++         "type": "null"
++        }
++       ],
++       "title": "Authorization"
++      }
++     }
++    ],
++    "requestBody": {
++     "content": {
++      "application/json": {
++       "schema": {
++        "$ref": "#/components/schemas/NewTenantIn"
++       }
++      }
++     },
++     "required": true
++    },
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "additionalProperties": true,
++         "title": "Response Admin Create Tenant Admin Tenants Post",
++         "type": "object"
++        }
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
++    "summary": "Admin Create Tenant"
++   }
++  },
++  "/admin/tenants/{tenant_id}": {
++   "get": {
++    "operationId": "admin_tenant_admin_tenants__tenant_id__get",
++    "parameters": [
++     {
++      "in": "path",
++      "name": "tenant_id",
++      "required": true,
++      "schema": {
++       "title": "Tenant Id",
++       "type": "string"
++      }
++     },
++     {
++      "in": "header",
++      "name": "authorization",
++      "required": false,
++      "schema": {
++       "anyOf": [
++        {
++         "type": "string"
++        },
++        {
++         "type": "null"
++        }
++       ],
++       "title": "Authorization"
++      }
++     }
++    ],
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "additionalProperties": true,
++         "title": "Response Admin Tenant Admin Tenants  Tenant Id  Get",
++         "type": "object"
++        }
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
++    "summary": "Admin Tenant"
++   }
++  },
++  "/admin/tenants/{tenant_id}/config": {
++   "put": {
++    "operationId": "admin_put_config_admin_tenants__tenant_id__config_put",
++    "parameters": [
++     {
++      "in": "path",
++      "name": "tenant_id",
++      "required": true,
++      "schema": {
++       "title": "Tenant Id",
++       "type": "string"
++      }
++     },
++     {
++      "in": "header",
++      "name": "authorization",
++      "required": false,
++      "schema": {
++       "anyOf": [
++        {
++         "type": "string"
++        },
++        {
++         "type": "null"
++        }
++       ],
++       "title": "Authorization"
++      }
++     }
++    ],
++    "requestBody": {
++     "content": {
++      "application/json": {
++       "schema": {
++        "additionalProperties": true,
++        "title": "Body",
++        "type": "object"
++       }
++      }
++     },
++     "required": true
++    },
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "additionalProperties": true,
++         "title": "Response Admin Put Config Admin Tenants  Tenant Id  Config Put",
++         "type": "object"
++        }
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
++    "summary": "Admin Put Config"
++   }
++  },
++  "/admin/tenants/{tenant_id}/keys": {
++   "post": {
++    "operationId": "admin_issue_key_admin_tenants__tenant_id__keys_post",
++    "parameters": [
++     {
++      "in": "path",
++      "name": "tenant_id",
++      "required": true,
++      "schema": {
++       "title": "Tenant Id",
++       "type": "string"
++      }
++     },
++     {
++      "in": "header",
++      "name": "authorization",
++      "required": false,
++      "schema": {
++       "anyOf": [
++        {
++         "type": "string"
++        },
++        {
++         "type": "null"
++        }
++       ],
++       "title": "Authorization"
++      }
++     }
++    ],
++    "requestBody": {
++     "content": {
++      "application/json": {
++       "schema": {
++        "$ref": "#/components/schemas/NewKeyIn"
++       }
++      }
++     },
++     "required": true
++    },
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "additionalProperties": true,
++         "title": "Response Admin Issue Key Admin Tenants  Tenant Id  Keys Post",
++         "type": "object"
++        }
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
++    "summary": "Admin Issue Key"
++   }
++  },
++  "/admin/tenants/{tenant_id}/keys/{key_id}": {
++   "delete": {
++    "operationId": "admin_revoke_key_admin_tenants__tenant_id__keys__key_id__delete",
++    "parameters": [
++     {
++      "in": "path",
++      "name": "tenant_id",
++      "required": true,
++      "schema": {
++       "title": "Tenant Id",
++       "type": "string"
++      }
++     },
++     {
++      "in": "path",
++      "name": "key_id",
++      "required": true,
++      "schema": {
++       "title": "Key Id",
++       "type": "integer"
++      }
++     },
++     {
++      "in": "header",
++      "name": "authorization",
++      "required": false,
++      "schema": {
++       "anyOf": [
++        {
++         "type": "string"
++        },
++        {
++         "type": "null"
++        }
++       ],
++       "title": "Authorization"
++      }
++     }
++    ],
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "additionalProperties": true,
++         "title": "Response Admin Revoke Key Admin Tenants  Tenant Id  Keys  Key Id  Delete",
++         "type": "object"
++        }
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
++    "summary": "Admin Revoke Key"
++   }
++  },
++  "/admin/tenants/{tenant_id}/plan": {
++   "put": {
++    "operationId": "admin_set_plan_admin_tenants__tenant_id__plan_put",
++    "parameters": [
++     {
++      "in": "path",
++      "name": "tenant_id",
++      "required": true,
++      "schema": {
++       "title": "Tenant Id",
++       "type": "string"
++      }
++     },
++     {
++      "in": "header",
++      "name": "authorization",
++      "required": false,
++      "schema": {
++       "anyOf": [
++        {
++         "type": "string"
++        },
++        {
++         "type": "null"
++        }
++       ],
++       "title": "Authorization"
++      }
++     }
++    ],
++    "requestBody": {
++     "content": {
++      "application/json": {
++       "schema": {
++        "$ref": "#/components/schemas/PlanChangeIn"
++       }
++      }
++     },
++     "required": true
++    },
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "additionalProperties": true,
++         "title": "Response Admin Set Plan Admin Tenants  Tenant Id  Plan Put",
++         "type": "object"
++        }
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
++    "summary": "Admin Set Plan"
++   }
++  },
++  "/admin/tenants/{tenant_id}/resume": {
++   "post": {
++    "operationId": "admin_resume_admin_tenants__tenant_id__resume_post",
++    "parameters": [
++     {
++      "in": "path",
++      "name": "tenant_id",
++      "required": true,
++      "schema": {
++       "title": "Tenant Id",
++       "type": "string"
++      }
++     },
++     {
++      "in": "header",
++      "name": "authorization",
++      "required": false,
++      "schema": {
++       "anyOf": [
++        {
++         "type": "string"
++        },
++        {
++         "type": "null"
++        }
++       ],
++       "title": "Authorization"
++      }
++     }
++    ],
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "additionalProperties": true,
++         "title": "Response Admin Resume Admin Tenants  Tenant Id  Resume Post",
++         "type": "object"
++        }
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
++    "summary": "Admin Resume"
++   }
++  },
++  "/admin/tenants/{tenant_id}/secrets/{section}": {
++   "delete": {
++    "operationId": "admin_delete_secrets_admin_tenants__tenant_id__secrets__section__delete",
++    "parameters": [
++     {
++      "in": "path",
++      "name": "tenant_id",
++      "required": true,
++      "schema": {
++       "title": "Tenant Id",
++       "type": "string"
++      }
++     },
++     {
++      "in": "path",
++      "name": "section",
++      "required": true,
++      "schema": {
++       "title": "Section",
++       "type": "string"
++      }
++     },
++     {
++      "in": "header",
++      "name": "authorization",
++      "required": false,
++      "schema": {
++       "anyOf": [
++        {
++         "type": "string"
++        },
++        {
++         "type": "null"
++        }
++       ],
++       "title": "Authorization"
++      }
++     }
++    ],
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "additionalProperties": true,
++         "title": "Response Admin Delete Secrets Admin Tenants  Tenant Id  Secrets  Section  Delete",
++         "type": "object"
++        }
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
++    "summary": "Admin Delete Secrets"
++   },
++   "put": {
++    "operationId": "admin_put_secrets_admin_tenants__tenant_id__secrets__section__put",
++    "parameters": [
++     {
++      "in": "path",
++      "name": "tenant_id",
++      "required": true,
++      "schema": {
++       "title": "Tenant Id",
++       "type": "string"
++      }
++     },
++     {
++      "in": "path",
++      "name": "section",
++      "required": true,
++      "schema": {
++       "title": "Section",
++       "type": "string"
++      }
++     },
++     {
++      "in": "header",
++      "name": "authorization",
++      "required": false,
++      "schema": {
++       "anyOf": [
++        {
++         "type": "string"
++        },
++        {
++         "type": "null"
++        }
++       ],
++       "title": "Authorization"
++      }
++     }
++    ],
++    "requestBody": {
++     "content": {
++      "application/json": {
++       "schema": {
++        "additionalProperties": {
++         "type": "string"
++        },
++        "title": "Body",
++        "type": "object"
++       }
++      }
++     },
++     "required": true
++    },
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "additionalProperties": true,
++         "title": "Response Admin Put Secrets Admin Tenants  Tenant Id  Secrets  Section  Put",
++         "type": "object"
++        }
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
++    "summary": "Admin Put Secrets"
++   }
++  },
++  "/admin/tenants/{tenant_id}/suspend": {
++   "post": {
++    "operationId": "admin_suspend_admin_tenants__tenant_id__suspend_post",
++    "parameters": [
++     {
++      "in": "path",
++      "name": "tenant_id",
++      "required": true,
++      "schema": {
++       "title": "Tenant Id",
++       "type": "string"
++      }
++     },
++     {
++      "in": "header",
++      "name": "authorization",
++      "required": false,
++      "schema": {
++       "anyOf": [
++        {
++         "type": "string"
++        },
++        {
++         "type": "null"
++        }
++       ],
++       "title": "Authorization"
++      }
++     }
++    ],
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "additionalProperties": true,
++         "title": "Response Admin Suspend Admin Tenants  Tenant Id  Suspend Post",
++         "type": "object"
++        }
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
++    "summary": "Admin Suspend"
++   }
++  },
++  "/connect/callback/{provider}": {
++   "get": {
++    "description": "Where the platform sends the browser after the owner approves. Always answers with a redirect to the console.",
++    "operationId": "connect_callback_connect_callback__provider__get",
++    "parameters": [
++     {
++      "in": "path",
++      "name": "provider",
++      "required": true,
++      "schema": {
++       "title": "Provider",
++       "type": "string"
++      }
++     }
++    ],
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {}
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
++    "summary": "Connect Callback"
++   }
++  },
++  "/health": {
++   "get": {
++    "operationId": "health_health_get",
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "additionalProperties": true,
++         "title": "Response Health Health Get",
++         "type": "object"
++        }
++       }
++      },
++      "description": "Successful Response"
++     }
++    },
++    "summary": "Health"
++   }
++  },
++  "/media/{tenant_id}/{name}": {
++   "get": {
++    "description": "Images the social platforms fetch when we post. Only files copied to media/public under a random name.",
++    "operationId": "public_media_media__tenant_id___name__get",
++    "parameters": [
++     {
++      "in": "path",
++      "name": "tenant_id",
++      "required": true,
++      "schema": {
++       "title": "Tenant Id",
++       "type": "string"
++      }
++     },
++     {
++      "in": "path",
++      "name": "name",
++      "required": true,
++      "schema": {
++       "title": "Name",
++       "type": "string"
++      }
++     }
++    ],
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {}
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
++    "summary": "Public Media"
++   }
++  },
 +  "/pi/{tenant_id}/{sku}/{n}": {
 +   "get": {
 +    "description": "A product photo the rep sends in a chat. Catalogue photos are meant to be seen, so the link needs no login; nothing else is served here.",
@@ -6636,127 +7657,246 @@ index 1c8fa03..774d60d 100644
 +    "summary": "Public Product Photo"
 +   }
 +  },
-   "/public/{tenant_id}/lead": {
-    "post": {
-     "operationId": "public_lead_public__tenant_id__lead_post",
-@@ -1918,9 +2507,9 @@
-     "summary": "Site"
-    }
-   },
--  "/v1/analytics/campaign-metrics": {
--   "post": {
--    "operationId": "metrics_v1_analytics_campaign_metrics_post",
++  "/public/{tenant_id}/lead": {
++   "post": {
++    "operationId": "public_lead_public__tenant_id__lead_post",
++    "parameters": [
++     {
++      "in": "path",
++      "name": "tenant_id",
++      "required": true,
++      "schema": {
++       "title": "Tenant Id",
++       "type": "string"
++      }
++     }
++    ],
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {}
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
++    "summary": "Public Lead"
++   }
++  },
++  "/sites/{tenant_id}": {
++   "get": {
++    "operationId": "site_sites__tenant_id__get",
++    "parameters": [
++     {
++      "in": "path",
++      "name": "tenant_id",
++      "required": true,
++      "schema": {
++       "title": "Tenant Id",
++       "type": "string"
++      }
++     }
++    ],
++    "responses": {
++     "200": {
++      "content": {
++       "text/html": {
++        "schema": {
++         "type": "string"
++        }
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
++    "summary": "Site"
++   }
++  },
 +  "/v1/alerts": {
 +   "delete": {
 +    "operationId": "alerts_unlink_v1_alerts_delete",
-     "parameters": [
-      {
-       "in": "header",
-@@ -1939,23 +2528,13 @@
-       }
-      }
-     ],
--    "requestBody": {
--     "content": {
--      "application/json": {
--       "schema": {
--        "$ref": "#/components/schemas/MetricsIn"
--       }
--      }
--     },
--     "required": true
--    },
-     "responses": {
-      "200": {
-       "content": {
-        "application/json": {
-         "schema": {
-          "additionalProperties": true,
--         "title": "Response Metrics V1 Analytics Campaign Metrics Post",
++    "parameters": [
++     {
++      "in": "header",
++      "name": "authorization",
++      "required": false,
++      "schema": {
++       "anyOf": [
++        {
++         "type": "string"
++        },
++        {
++         "type": "null"
++        }
++       ],
++       "title": "Authorization"
++      }
++     }
++    ],
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "additionalProperties": true,
 +         "title": "Response Alerts Unlink V1 Alerts Delete",
-          "type": "object"
-         }
-        }
-@@ -1973,12 +2552,11 @@
-       "description": "Validation Error"
-      }
-     },
--    "summary": "Metrics"
--   }
--  },
--  "/v1/analytics/campaigns": {
++         "type": "object"
++        }
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
 +    "summary": "Alerts Unlink"
 +   },
-    "get": {
--    "operationId": "campaigns_v1_analytics_campaigns_get",
++   "get": {
 +    "description": "Silent owner alerts: whether the owner's Telegram is linked, and the code to send the business's bot (`/owner <code>`) to link it.",
 +    "operationId": "alerts_state_v1_alerts_get",
-     "parameters": [
-      {
-       "in": "header",
-@@ -2002,12 +2580,9 @@
-       "content": {
-        "application/json": {
-         "schema": {
--         "items": {
--          "additionalProperties": true,
--          "type": "object"
--         },
--         "title": "Response Campaigns V1 Analytics Campaigns Get",
--         "type": "array"
++    "parameters": [
++     {
++      "in": "header",
++      "name": "authorization",
++      "required": false,
++      "schema": {
++       "anyOf": [
++        {
++         "type": "string"
++        },
++        {
++         "type": "null"
++        }
++       ],
++       "title": "Authorization"
++      }
++     }
++    ],
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {
 +         "additionalProperties": true,
 +         "title": "Response Alerts State V1 Alerts Get",
 +         "type": "object"
-         }
-        }
-       },
-@@ -2024,12 +2599,12 @@
-       "description": "Validation Error"
-      }
-     },
--    "summary": "Campaigns"
++        }
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
 +    "summary": "Alerts State"
-    }
-   },
--  "/v1/analytics/funnel": {
--   "get": {
--    "operationId": "funnel_v1_analytics_funnel_get",
++   }
++  },
 +  "/v1/alerts/test": {
 +   "post": {
 +    "operationId": "alerts_test_v1_alerts_test_post",
-     "parameters": [
-      {
-       "in": "header",
-@@ -2054,7 +2629,7 @@
-        "application/json": {
-         "schema": {
-          "additionalProperties": true,
--         "title": "Response Funnel V1 Analytics Funnel Get",
++    "parameters": [
++     {
++      "in": "header",
++      "name": "authorization",
++      "required": false,
++      "schema": {
++       "anyOf": [
++        {
++         "type": "string"
++        },
++        {
++         "type": "null"
++        }
++       ],
++       "title": "Authorization"
++      }
++     }
++    ],
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "additionalProperties": true,
 +         "title": "Response Alerts Test V1 Alerts Test Post",
-          "type": "object"
-         }
-        }
-@@ -2072,12 +2647,12 @@
-       "description": "Validation Error"
-      }
-     },
--    "summary": "Funnel"
++         "type": "object"
++        }
++       }
++      },
++      "description": "Successful Response"
++     },
++     "422": {
++      "content": {
++       "application/json": {
++        "schema": {
++         "$ref": "#/components/schemas/HTTPValidationError"
++        }
++       }
++      },
++      "description": "Validation Error"
++     }
++    },
 +    "summary": "Alerts Test"
-    }
-   },
--  "/v1/approvals": {
--   "get": {
--    "operationId": "pending_v1_approvals_get",
++   }
++  },
 +  "/v1/analytics/campaign-metrics": {
 +   "post": {
 +    "operationId": "metrics_v1_analytics_campaign_metrics_post",
-     "parameters": [
-      {
-       "in": "header",
-@@ -2096,17 +2671,2431 @@
-       }
-      }
-     ],
++    "parameters": [
++     {
++      "in": "header",
++      "name": "authorization",
++      "required": false,
++      "schema": {
++       "anyOf": [
++        {
++         "type": "string"
++        },
++        {
++         "type": "null"
++        }
++       ],
++       "title": "Authorization"
++      }
++     }
++    ],
 +    "requestBody": {
 +     "content": {
 +      "application/json": {
@@ -6767,17 +7907,11 @@ index 1c8fa03..774d60d 100644
 +     },
 +     "required": true
 +    },
-     "responses": {
-      "200": {
-       "content": {
-        "application/json": {
-         "schema": {
--         "items": {
--          "additionalProperties": true,
--          "type": "object"
--         },
--         "title": "Response Pending V1 Approvals Get",
--         "type": "array"
++    "responses": {
++     "200": {
++      "content": {
++       "application/json": {
++        "schema": {
 +         "additionalProperties": true,
 +         "title": "Response Metrics V1 Analytics Campaign Metrics Post",
 +         "type": "object"
@@ -8169,46 +9303,30 @@ index 1c8fa03..774d60d 100644
 +         },
 +         "title": "Response Content List V1 Content Get",
 +         "type": "array"
-+        }
-+       }
-+      },
-+      "description": "Successful Response"
-+     },
-+     "422": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "$ref": "#/components/schemas/HTTPValidationError"
-+        }
-+       }
-+      },
-+      "description": "Validation Error"
-+     }
-+    },
+         }
+        }
+       },
+@@ -993,12 +4136,12 @@
+       "description": "Validation Error"
+      }
+     },
+-    "summary": "Admin Me"
 +    "summary": "Content List"
-+   }
-+  },
+    }
+   },
+-  "/admin/overview": {
+-   "get": {
+-    "operationId": "admin_overview_admin_overview_get",
 +  "/v1/content/plan": {
 +   "post": {
 +    "operationId": "plan_v1_content_plan_post",
-+    "parameters": [
-+     {
-+      "in": "header",
-+      "name": "authorization",
-+      "required": false,
-+      "schema": {
-+       "anyOf": [
-+        {
-+         "type": "string"
-+        },
-+        {
-+         "type": "null"
-+        }
-+       ],
-+       "title": "Authorization"
-+      }
-+     }
-+    ],
+     "parameters": [
+      {
+       "in": "header",
+@@ -1017,13 +4160,23 @@
+       }
+      }
+     ],
 +    "requestBody": {
 +     "content": {
 +      "application/json": {
@@ -8219,85 +9337,65 @@ index 1c8fa03..774d60d 100644
 +     },
 +     "required": true
 +    },
-+    "responses": {
-+     "200": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "additionalProperties": true,
+     "responses": {
+      "200": {
+       "content": {
+        "application/json": {
+         "schema": {
+          "additionalProperties": true,
+-         "title": "Response Admin Overview Admin Overview Get",
 +         "title": "Response Plan V1 Content Plan Post",
-+         "type": "object"
-+        }
-+       }
-+      },
-+      "description": "Successful Response"
-+     },
-+     "422": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "$ref": "#/components/schemas/HTTPValidationError"
-+        }
-+       }
-+      },
-+      "description": "Validation Error"
-+     }
-+    },
+          "type": "object"
+         }
+        }
+@@ -1041,12 +4194,12 @@
+       "description": "Validation Error"
+      }
+     },
+-    "summary": "Admin Overview"
 +    "summary": "Plan"
-+   }
-+  },
+    }
+   },
+-  "/admin/plans": {
+-   "get": {
+-    "operationId": "admin_plans_admin_plans_get",
 +  "/v1/content/publish-due": {
 +   "post": {
 +    "operationId": "content_publish_due_v1_content_publish_due_post",
-+    "parameters": [
-+     {
-+      "in": "header",
-+      "name": "authorization",
-+      "required": false,
-+      "schema": {
-+       "anyOf": [
-+        {
-+         "type": "string"
-+        },
-+        {
-+         "type": "null"
-+        }
-+       ],
-+       "title": "Authorization"
-+      }
-+     }
-+    ],
-+    "responses": {
-+     "200": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
+     "parameters": [
+      {
+       "in": "header",
+@@ -1070,12 +4223,9 @@
+       "content": {
+        "application/json": {
+         "schema": {
+-         "items": {
+-          "additionalProperties": true,
+-          "type": "object"
+-         },
+-         "title": "Response Admin Plans Admin Plans Get",
+-         "type": "array"
 +         "additionalProperties": true,
 +         "title": "Response Content Publish Due V1 Content Publish Due Post",
 +         "type": "object"
-+        }
-+       }
-+      },
-+      "description": "Successful Response"
-+     },
-+     "422": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "$ref": "#/components/schemas/HTTPValidationError"
-+        }
-+       }
-+      },
-+      "description": "Validation Error"
-+     }
-+    },
+         }
+        }
+       },
+@@ -1092,13 +4242,22 @@
+       "description": "Validation Error"
+      }
+     },
+-    "summary": "Admin Plans"
 +    "summary": "Content Publish Due"
-+   }
-+  },
+    }
+   },
+-  "/admin/tenants": {
+-   "post": {
+-    "operationId": "admin_create_tenant_admin_tenants_post",
 +  "/v1/content/{item_id}": {
 +   "put": {
 +    "operationId": "content_edit_v1_content__item_id__put",
-+    "parameters": [
+     "parameters": [
 +     {
 +      "in": "path",
 +      "name": "item_id",
@@ -8307,151 +9405,99 @@ index 1c8fa03..774d60d 100644
 +       "type": "integer"
 +      }
 +     },
-+     {
-+      "in": "header",
-+      "name": "authorization",
-+      "required": false,
-+      "schema": {
-+       "anyOf": [
-+        {
-+         "type": "string"
-+        },
-+        {
-+         "type": "null"
-+        }
-+       ],
-+       "title": "Authorization"
-+      }
-+     }
-+    ],
-+    "requestBody": {
-+     "content": {
-+      "application/json": {
-+       "schema": {
+      {
+       "in": "header",
+       "name": "authorization",
+@@ -1120,7 +4279,7 @@
+      "content": {
+       "application/json": {
+        "schema": {
+-        "$ref": "#/components/schemas/NewTenantIn"
 +        "$ref": "#/components/schemas/EditIn"
-+       }
-+      }
-+     },
-+     "required": true
-+    },
-+    "responses": {
-+     "200": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "additionalProperties": true,
+        }
+       }
+      },
+@@ -1132,7 +4291,7 @@
+        "application/json": {
+         "schema": {
+          "additionalProperties": true,
+-         "title": "Response Admin Create Tenant Admin Tenants Post",
 +         "title": "Response Content Edit V1 Content  Item Id  Put",
-+         "type": "object"
-+        }
-+       }
-+      },
-+      "description": "Successful Response"
-+     },
-+     "422": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "$ref": "#/components/schemas/HTTPValidationError"
-+        }
-+       }
-+      },
-+      "description": "Validation Error"
-+     }
-+    },
+          "type": "object"
+         }
+        }
+@@ -1150,20 +4309,20 @@
+       "description": "Validation Error"
+      }
+     },
+-    "summary": "Admin Create Tenant"
 +    "summary": "Content Edit"
-+   }
-+  },
+    }
+   },
+-  "/admin/tenants/{tenant_id}": {
+-   "get": {
+-    "operationId": "admin_tenant_admin_tenants__tenant_id__get",
 +  "/v1/content/{item_id}/approve": {
 +   "post": {
 +    "operationId": "content_approve_v1_content__item_id__approve_post",
-+    "parameters": [
-+     {
-+      "in": "path",
+     "parameters": [
+      {
+       "in": "path",
+-      "name": "tenant_id",
 +      "name": "item_id",
-+      "required": true,
-+      "schema": {
+       "required": true,
+       "schema": {
+-       "title": "Tenant Id",
+-       "type": "string"
 +       "title": "Item Id",
 +       "type": "integer"
-+      }
-+     },
-+     {
-+      "in": "header",
-+      "name": "authorization",
-+      "required": false,
-+      "schema": {
-+       "anyOf": [
-+        {
-+         "type": "string"
-+        },
-+        {
-+         "type": "null"
-+        }
-+       ],
-+       "title": "Authorization"
-+      }
-+     }
-+    ],
-+    "responses": {
-+     "200": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "additionalProperties": true,
+       }
+      },
+      {
+@@ -1189,7 +4348,7 @@
+        "application/json": {
+         "schema": {
+          "additionalProperties": true,
+-         "title": "Response Admin Tenant Admin Tenants  Tenant Id  Get",
 +         "title": "Response Content Approve V1 Content  Item Id  Approve Post",
-+         "type": "object"
-+        }
-+       }
-+      },
-+      "description": "Successful Response"
-+     },
-+     "422": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "$ref": "#/components/schemas/HTTPValidationError"
-+        }
-+       }
-+      },
-+      "description": "Validation Error"
-+     }
-+    },
+          "type": "object"
+         }
+        }
+@@ -1207,20 +4366,20 @@
+       "description": "Validation Error"
+      }
+     },
+-    "summary": "Admin Tenant"
 +    "summary": "Content Approve"
-+   }
-+  },
+    }
+   },
+-  "/admin/tenants/{tenant_id}/config": {
+-   "put": {
+-    "operationId": "admin_put_config_admin_tenants__tenant_id__config_put",
 +  "/v1/content/{item_id}/image": {
 +   "post": {
 +    "operationId": "content_image_v1_content__item_id__image_post",
-+    "parameters": [
-+     {
-+      "in": "path",
+     "parameters": [
+      {
+       "in": "path",
+-      "name": "tenant_id",
 +      "name": "item_id",
-+      "required": true,
-+      "schema": {
+       "required": true,
+       "schema": {
+-       "title": "Tenant Id",
+-       "type": "string"
 +       "title": "Item Id",
 +       "type": "integer"
-+      }
-+     },
-+     {
-+      "in": "header",
-+      "name": "authorization",
-+      "required": false,
-+      "schema": {
-+       "anyOf": [
-+        {
-+         "type": "string"
-+        },
-+        {
-+         "type": "null"
-+        }
-+       ],
-+       "title": "Authorization"
-+      }
-+     }
-+    ],
-+    "requestBody": {
-+     "content": {
-+      "application/json": {
-+       "schema": {
+       }
+      },
+      {
+@@ -1244,13 +4403,18 @@
+      "content": {
+       "application/json": {
+        "schema": {
+-        "additionalProperties": true,
+-        "title": "Body",
+-        "type": "object"
 +        "anyOf": [
 +         {
 +          "$ref": "#/components/schemas/ImageIn"
@@ -8461,416 +9507,355 @@ index 1c8fa03..774d60d 100644
 +         }
 +        ],
 +        "title": "Body"
-+       }
-+      }
+        }
+       }
+-     },
+-     "required": true
 +     }
-+    },
-+    "responses": {
-+     "200": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "additionalProperties": true,
+     },
+     "responses": {
+      "200": {
+@@ -1258,7 +4422,7 @@
+        "application/json": {
+         "schema": {
+          "additionalProperties": true,
+-         "title": "Response Admin Put Config Admin Tenants  Tenant Id  Config Put",
 +         "title": "Response Content Image V1 Content  Item Id  Image Post",
-+         "type": "object"
-+        }
-+       }
-+      },
-+      "description": "Successful Response"
-+     },
-+     "422": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "$ref": "#/components/schemas/HTTPValidationError"
-+        }
-+       }
-+      },
-+      "description": "Validation Error"
-+     }
-+    },
+          "type": "object"
+         }
+        }
+@@ -1276,20 +4440,20 @@
+       "description": "Validation Error"
+      }
+     },
+-    "summary": "Admin Put Config"
 +    "summary": "Content Image"
-+   }
-+  },
+    }
+   },
+-  "/admin/tenants/{tenant_id}/keys": {
 +  "/v1/content/{item_id}/mark-posted": {
-+   "post": {
+    "post": {
+-    "operationId": "admin_issue_key_admin_tenants__tenant_id__keys_post",
 +    "operationId": "content_mark_posted_v1_content__item_id__mark_posted_post",
-+    "parameters": [
-+     {
-+      "in": "path",
+     "parameters": [
+      {
+       "in": "path",
+-      "name": "tenant_id",
 +      "name": "item_id",
-+      "required": true,
-+      "schema": {
+       "required": true,
+       "schema": {
+-       "title": "Tenant Id",
+-       "type": "string"
 +       "title": "Item Id",
 +       "type": "integer"
-+      }
-+     },
-+     {
-+      "in": "header",
-+      "name": "authorization",
-+      "required": false,
-+      "schema": {
-+       "anyOf": [
-+        {
-+         "type": "string"
-+        },
-+        {
-+         "type": "null"
-+        }
-+       ],
-+       "title": "Authorization"
-+      }
-+     }
-+    ],
-+    "responses": {
-+     "200": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "additionalProperties": true,
+       }
+      },
+      {
+@@ -1309,23 +4473,13 @@
+       }
+      }
+     ],
+-    "requestBody": {
+-     "content": {
+-      "application/json": {
+-       "schema": {
+-        "$ref": "#/components/schemas/NewKeyIn"
+-       }
+-      }
+-     },
+-     "required": true
+-    },
+     "responses": {
+      "200": {
+       "content": {
+        "application/json": {
+         "schema": {
+          "additionalProperties": true,
+-         "title": "Response Admin Issue Key Admin Tenants  Tenant Id  Keys Post",
 +         "title": "Response Content Mark Posted V1 Content  Item Id  Mark Posted Post",
-+         "type": "object"
-+        }
-+       }
-+      },
-+      "description": "Successful Response"
-+     },
-+     "422": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "$ref": "#/components/schemas/HTTPValidationError"
-+        }
-+       }
-+      },
-+      "description": "Validation Error"
-+     }
-+    },
+          "type": "object"
+         }
+        }
+@@ -1343,28 +4497,19 @@
+       "description": "Validation Error"
+      }
+     },
+-    "summary": "Admin Issue Key"
 +    "summary": "Content Mark Posted"
-+   }
-+  },
+    }
+   },
+-  "/admin/tenants/{tenant_id}/keys/{key_id}": {
+-   "delete": {
+-    "operationId": "admin_revoke_key_admin_tenants__tenant_id__keys__key_id__delete",
 +  "/v1/content/{item_id}/media": {
 +   "get": {
 +    "operationId": "content_media_v1_content__item_id__media_get",
-+    "parameters": [
-+     {
-+      "in": "path",
+     "parameters": [
+      {
+       "in": "path",
+-      "name": "tenant_id",
+-      "required": true,
+-      "schema": {
+-       "title": "Tenant Id",
+-       "type": "string"
+-      }
+-     },
+-     {
+-      "in": "path",
+-      "name": "key_id",
 +      "name": "item_id",
-+      "required": true,
-+      "schema": {
+       "required": true,
+       "schema": {
+-       "title": "Key Id",
 +       "title": "Item Id",
-+       "type": "integer"
-+      }
-+     },
-+     {
-+      "in": "header",
-+      "name": "authorization",
-+      "required": false,
-+      "schema": {
-+       "anyOf": [
-+        {
-+         "type": "string"
-+        },
-+        {
-+         "type": "null"
-+        }
-+       ],
-+       "title": "Authorization"
-+      }
-+     }
-+    ],
-+    "responses": {
-+     "200": {
-+      "content": {
-+       "application/json": {
+        "type": "integer"
+       }
+      },
+@@ -1389,11 +4534,7 @@
+      "200": {
+       "content": {
+        "application/json": {
+-        "schema": {
+-         "additionalProperties": true,
+-         "title": "Response Admin Revoke Key Admin Tenants  Tenant Id  Keys  Key Id  Delete",
+-         "type": "object"
+-        }
 +        "schema": {}
-+       }
-+      },
-+      "description": "Successful Response"
-+     },
-+     "422": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "$ref": "#/components/schemas/HTTPValidationError"
-+        }
-+       }
-+      },
-+      "description": "Validation Error"
-+     }
-+    },
+        }
+       },
+       "description": "Successful Response"
+@@ -1409,20 +4550,20 @@
+       "description": "Validation Error"
+      }
+     },
+-    "summary": "Admin Revoke Key"
 +    "summary": "Content Media"
-+   }
-+  },
+    }
+   },
+-  "/admin/tenants/{tenant_id}/plan": {
+-   "put": {
+-    "operationId": "admin_set_plan_admin_tenants__tenant_id__plan_put",
 +  "/v1/content/{item_id}/publish": {
 +   "post": {
 +    "operationId": "content_publish_v1_content__item_id__publish_post",
-+    "parameters": [
-+     {
-+      "in": "path",
+     "parameters": [
+      {
+       "in": "path",
+-      "name": "tenant_id",
 +      "name": "item_id",
-+      "required": true,
-+      "schema": {
+       "required": true,
+       "schema": {
+-       "title": "Tenant Id",
+-       "type": "string"
 +       "title": "Item Id",
 +       "type": "integer"
-+      }
-+     },
-+     {
-+      "in": "header",
-+      "name": "authorization",
-+      "required": false,
-+      "schema": {
-+       "anyOf": [
-+        {
-+         "type": "string"
-+        },
-+        {
-+         "type": "null"
-+        }
-+       ],
-+       "title": "Authorization"
-+      }
-+     }
-+    ],
-+    "responses": {
-+     "200": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "additionalProperties": true,
+       }
+      },
+      {
+@@ -1442,23 +4583,13 @@
+       }
+      }
+     ],
+-    "requestBody": {
+-     "content": {
+-      "application/json": {
+-       "schema": {
+-        "$ref": "#/components/schemas/PlanChangeIn"
+-       }
+-      }
+-     },
+-     "required": true
+-    },
+     "responses": {
+      "200": {
+       "content": {
+        "application/json": {
+         "schema": {
+          "additionalProperties": true,
+-         "title": "Response Admin Set Plan Admin Tenants  Tenant Id  Plan Put",
 +         "title": "Response Content Publish V1 Content  Item Id  Publish Post",
-+         "type": "object"
-+        }
-+       }
-+      },
-+      "description": "Successful Response"
-+     },
-+     "422": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "$ref": "#/components/schemas/HTTPValidationError"
-+        }
-+       }
-+      },
-+      "description": "Validation Error"
-+     }
-+    },
+          "type": "object"
+         }
+        }
+@@ -1476,20 +4607,21 @@
+       "description": "Validation Error"
+      }
+     },
+-    "summary": "Admin Set Plan"
 +    "summary": "Content Publish"
-+   }
-+  },
+    }
+   },
+-  "/admin/tenants/{tenant_id}/resume": {
 +  "/v1/content/{item_id}/reel": {
-+   "post": {
+    "post": {
+-    "operationId": "admin_resume_admin_tenants__tenant_id__resume_post",
 +    "description": "Start making a short vertical video from the post's video script (one AI picture per beat, joined by ffmpeg). It takes a minute or two,\nso it runs in the background: the post gets its video, or an error, when it is done. It still needs approval to post.",
 +    "operationId": "content_reel_v1_content__item_id__reel_post",
-+    "parameters": [
-+     {
-+      "in": "path",
+     "parameters": [
+      {
+       "in": "path",
+-      "name": "tenant_id",
 +      "name": "item_id",
-+      "required": true,
-+      "schema": {
+       "required": true,
+       "schema": {
+-       "title": "Tenant Id",
+-       "type": "string"
 +       "title": "Item Id",
 +       "type": "integer"
-+      }
-+     },
-+     {
-+      "in": "header",
-+      "name": "authorization",
-+      "required": false,
-+      "schema": {
-+       "anyOf": [
-+        {
-+         "type": "string"
-+        },
-+        {
-+         "type": "null"
-+        }
-+       ],
-+       "title": "Authorization"
-+      }
-+     }
-+    ],
-+    "responses": {
+       }
+      },
+      {
+@@ -1510,12 +4642,12 @@
+      }
+     ],
+     "responses": {
+-     "200": {
 +     "202": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "additionalProperties": true,
+       "content": {
+        "application/json": {
+         "schema": {
+          "additionalProperties": true,
+-         "title": "Response Admin Resume Admin Tenants  Tenant Id  Resume Post",
 +         "title": "Response Content Reel V1 Content  Item Id  Reel Post",
-+         "type": "object"
-+        }
-+       }
-+      },
-+      "description": "Successful Response"
-+     },
-+     "422": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "$ref": "#/components/schemas/HTTPValidationError"
-+        }
-+       }
-+      },
-+      "description": "Validation Error"
-+     }
-+    },
+          "type": "object"
+         }
+        }
+@@ -1533,29 +4665,20 @@
+       "description": "Validation Error"
+      }
+     },
+-    "summary": "Admin Resume"
 +    "summary": "Content Reel"
-+   }
-+  },
+    }
+   },
+-  "/admin/tenants/{tenant_id}/secrets/{section}": {
+-   "delete": {
+-    "operationId": "admin_delete_secrets_admin_tenants__tenant_id__secrets__section__delete",
 +  "/v1/content/{item_id}/reject": {
 +   "post": {
 +    "operationId": "content_reject_v1_content__item_id__reject_post",
-+    "parameters": [
-+     {
-+      "in": "path",
+     "parameters": [
+      {
+       "in": "path",
+-      "name": "tenant_id",
+-      "required": true,
+-      "schema": {
+-       "title": "Tenant Id",
+-       "type": "string"
+-      }
+-     },
+-     {
+-      "in": "path",
+-      "name": "section",
 +      "name": "item_id",
-+      "required": true,
-+      "schema": {
+       "required": true,
+       "schema": {
+-       "title": "Section",
+-       "type": "string"
 +       "title": "Item Id",
 +       "type": "integer"
-+      }
-+     },
-+     {
-+      "in": "header",
-+      "name": "authorization",
-+      "required": false,
-+      "schema": {
-+       "anyOf": [
-+        {
-+         "type": "string"
-+        },
-+        {
-+         "type": "null"
-+        }
-+       ],
-+       "title": "Authorization"
-+      }
-+     }
-+    ],
-+    "responses": {
-+     "200": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "additionalProperties": true,
+       }
+      },
+      {
+@@ -1581,7 +4704,7 @@
+        "application/json": {
+         "schema": {
+          "additionalProperties": true,
+-         "title": "Response Admin Delete Secrets Admin Tenants  Tenant Id  Secrets  Section  Delete",
 +         "title": "Response Content Reject V1 Content  Item Id  Reject Post",
-+         "type": "object"
-+        }
-+       }
-+      },
-+      "description": "Successful Response"
-+     },
-+     "422": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "$ref": "#/components/schemas/HTTPValidationError"
-+        }
-+       }
-+      },
-+      "description": "Validation Error"
-+     }
-+    },
+          "type": "object"
+         }
+        }
+@@ -1599,27 +4722,20 @@
+       "description": "Validation Error"
+      }
+     },
+-    "summary": "Admin Delete Secrets"
+-   },
+-   "put": {
+-    "operationId": "admin_put_secrets_admin_tenants__tenant_id__secrets__section__put",
 +    "summary": "Content Reject"
 +   }
 +  },
 +  "/v1/content/{item_id}/schedule": {
 +   "post": {
 +    "operationId": "content_schedule_v1_content__item_id__schedule_post",
-+    "parameters": [
-+     {
-+      "in": "path",
+     "parameters": [
+      {
+       "in": "path",
+-      "name": "tenant_id",
+-      "required": true,
+-      "schema": {
+-       "title": "Tenant Id",
+-       "type": "string"
+-      }
+-     },
+-     {
+-      "in": "path",
+-      "name": "section",
 +      "name": "item_id",
-+      "required": true,
-+      "schema": {
+       "required": true,
+       "schema": {
+-       "title": "Section",
+-       "type": "string"
 +       "title": "Item Id",
 +       "type": "integer"
-+      }
-+     },
-+     {
-+      "in": "header",
-+      "name": "authorization",
-+      "required": false,
-+      "schema": {
-+       "anyOf": [
-+        {
-+         "type": "string"
-+        },
-+        {
-+         "type": "null"
-+        }
-+       ],
-+       "title": "Authorization"
-+      }
-+     }
-+    ],
-+    "requestBody": {
-+     "content": {
-+      "application/json": {
-+       "schema": {
+       }
+      },
+      {
+@@ -1643,11 +4759,7 @@
+      "content": {
+       "application/json": {
+        "schema": {
+-        "additionalProperties": {
+-         "type": "string"
+-        },
+-        "title": "Body",
+-        "type": "object"
 +        "$ref": "#/components/schemas/ScheduleIn"
-+       }
-+      }
-+     },
-+     "required": true
-+    },
-+    "responses": {
-+     "200": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "additionalProperties": true,
+        }
+       }
+      },
+@@ -1659,7 +4771,7 @@
+        "application/json": {
+         "schema": {
+          "additionalProperties": true,
+-         "title": "Response Admin Put Secrets Admin Tenants  Tenant Id  Secrets  Section  Put",
 +         "title": "Response Content Schedule V1 Content  Item Id  Schedule Post",
-+         "type": "object"
-+        }
-+       }
-+      },
-+      "description": "Successful Response"
-+     },
-+     "422": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "$ref": "#/components/schemas/HTTPValidationError"
-+        }
-+       }
-+      },
-+      "description": "Validation Error"
-+     }
-+    },
+          "type": "object"
+         }
+        }
+@@ -1677,20 +4789,20 @@
+       "description": "Validation Error"
+      }
+     },
+-    "summary": "Admin Put Secrets"
 +    "summary": "Content Schedule"
-+   }
-+  },
+    }
+   },
+-  "/admin/tenants/{tenant_id}/suspend": {
 +  "/v1/content/{item_id}/video": {
-+   "post": {
+    "post": {
+-    "operationId": "admin_suspend_admin_tenants__tenant_id__suspend_post",
 +    "operationId": "content_video_v1_content__item_id__video_post",
-+    "parameters": [
-+     {
-+      "in": "path",
+     "parameters": [
+      {
+       "in": "path",
+-      "name": "tenant_id",
 +      "name": "item_id",
-+      "required": true,
-+      "schema": {
+       "required": true,
+       "schema": {
+-       "title": "Tenant Id",
+-       "type": "string"
 +       "title": "Item Id",
 +       "type": "integer"
-+      }
-+     },
-+     {
-+      "in": "header",
-+      "name": "authorization",
-+      "required": false,
-+      "schema": {
-+       "anyOf": [
-+        {
-+         "type": "string"
-+        },
-+        {
-+         "type": "null"
-+        }
-+       ],
-+       "title": "Authorization"
-+      }
-+     }
-+    ],
+       }
+      },
+      {
+@@ -1710,13 +4822,23 @@
+       }
+      }
+     ],
 +    "requestBody": {
 +     "content": {
 +      "application/json": {
@@ -8881,60 +9866,114 @@ index 1c8fa03..774d60d 100644
 +     },
 +     "required": true
 +    },
-+    "responses": {
-+     "200": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "additionalProperties": true,
+     "responses": {
+      "200": {
+       "content": {
+        "application/json": {
+         "schema": {
+          "additionalProperties": true,
+-         "title": "Response Admin Suspend Admin Tenants  Tenant Id  Suspend Post",
 +         "title": "Response Content Video V1 Content  Item Id  Video Post",
-+         "type": "object"
-+        }
-+       }
-+      },
-+      "description": "Successful Response"
-+     },
-+     "422": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "$ref": "#/components/schemas/HTTPValidationError"
-+        }
-+       }
-+      },
-+      "description": "Validation Error"
-+     }
-+    },
+          "type": "object"
+         }
+        }
+@@ -1734,88 +4856,45 @@
+       "description": "Validation Error"
+      }
+     },
+-    "summary": "Admin Suspend"
 +    "summary": "Content Video"
-+   }
-+  },
+    }
+   },
+-  "/connect/callback/{provider}": {
+-   "get": {
+-    "description": "Where the platform sends the browser after the owner approves. Always answers with a redirect to the console.",
+-    "operationId": "connect_callback_connect_callback__provider__get",
 +  "/v1/customers/{channel}/{user_id}": {
 +   "delete": {
 +    "operationId": "erase_v1_customers__channel___user_id__delete",
-+    "parameters": [
-+     {
-+      "in": "path",
+     "parameters": [
+      {
+       "in": "path",
+-      "name": "provider",
 +      "name": "channel",
-+      "required": true,
-+      "schema": {
+       "required": true,
+       "schema": {
+-       "title": "Provider",
 +       "title": "Channel",
-+       "type": "string"
-+      }
-+     },
-+     {
-+      "in": "path",
+        "type": "string"
+       }
+-     }
+-    ],
+-    "responses": {
+-     "200": {
+-      "content": {
+-       "application/json": {
+-        "schema": {}
+-       }
+-      },
+-      "description": "Successful Response"
+      },
+-     "422": {
+-      "content": {
+-       "application/json": {
+-        "schema": {
+-         "$ref": "#/components/schemas/HTTPValidationError"
+-        }
+-       }
+-      },
+-      "description": "Validation Error"
+-     }
+-    },
+-    "summary": "Connect Callback"
+-   }
+-  },
+-  "/health": {
+-   "get": {
+-    "operationId": "health_health_get",
+-    "responses": {
+-     "200": {
+-      "content": {
+-       "application/json": {
+-        "schema": {
+-         "additionalProperties": true,
+-         "title": "Response Health Health Get",
+-         "type": "object"
+-        }
+-       }
+-      },
+-      "description": "Successful Response"
+-     }
+-    },
+-    "summary": "Health"
+-   }
+-  },
+-  "/media/{tenant_id}/{name}": {
+-   "get": {
+-    "description": "Images the social platforms fetch when we post. Only files copied to media/public under a random name.",
+-    "operationId": "public_media_media__tenant_id___name__get",
+-    "parameters": [
+      {
+       "in": "path",
+-      "name": "tenant_id",
 +      "name": "user_id",
-+      "required": true,
-+      "schema": {
+       "required": true,
+       "schema": {
+-       "title": "Tenant Id",
 +       "title": "User Id",
-+       "type": "string"
-+      }
-+     },
-+     {
+        "type": "string"
+       }
+      },
+      {
+-      "in": "path",
+-      "name": "name",
+-      "required": true,
 +      "in": "header",
 +      "name": "authorization",
 +      "required": false,
-+      "schema": {
+       "schema": {
+-       "title": "Name",
+-       "type": "string"
 +       "anyOf": [
 +        {
 +         "type": "string"
@@ -8944,46 +9983,47 @@ index 1c8fa03..774d60d 100644
 +        }
 +       ],
 +       "title": "Authorization"
-+      }
-+     }
-+    ],
-+    "responses": {
-+     "200": {
-+      "content": {
-+       "application/json": {
+       }
+      }
+     ],
+@@ -1823,7 +4902,11 @@
+      "200": {
+       "content": {
+        "application/json": {
+-        "schema": {}
 +        "schema": {
 +         "additionalProperties": true,
 +         "title": "Response Erase V1 Customers  Channel   User Id  Delete",
 +         "type": "object"
 +        }
-+       }
-+      },
-+      "description": "Successful Response"
-+     },
-+     "422": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "$ref": "#/components/schemas/HTTPValidationError"
-+        }
-+       }
-+      },
-+      "description": "Validation Error"
-+     }
-+    },
+        }
+       },
+       "description": "Successful Response"
+@@ -1839,66 +4922,49 @@
+       "description": "Validation Error"
+      }
+     },
+-    "summary": "Public Media"
 +    "summary": "Erase"
-+   }
-+  },
+    }
+   },
+-  "/public/{tenant_id}/lead": {
 +  "/v1/design": {
-+   "post": {
+    "post": {
+-    "operationId": "public_lead_public__tenant_id__lead_post",
 +    "description": "A flyer, banner or social creative. Prices and contact details come from the business record; Muse Image paints, Muse Spark checks.",
 +    "operationId": "design_make_v1_design_post",
-+    "parameters": [
-+     {
+     "parameters": [
+      {
+-      "in": "path",
+-      "name": "tenant_id",
+-      "required": true,
 +      "in": "header",
 +      "name": "authorization",
 +      "required": false,
-+      "schema": {
+       "schema": {
+-       "title": "Tenant Id",
+-       "type": "string"
 +       "anyOf": [
 +        {
 +         "type": "string"
@@ -8993,99 +10033,123 @@ index 1c8fa03..774d60d 100644
 +        }
 +       ],
 +       "title": "Authorization"
-+      }
-+     }
-+    ],
+       }
+      }
+     ],
+-    "responses": {
+-     "200": {
+-      "content": {
+-       "application/json": {
+-        "schema": {}
 +    "requestBody": {
 +     "content": {
 +      "application/json": {
 +       "schema": {
 +        "$ref": "#/components/schemas/DesignIn"
-+       }
+        }
+-      },
+-      "description": "Successful Response"
 +      }
-+     },
+      },
+-     "422": {
+-      "content": {
+-       "application/json": {
+-        "schema": {
+-         "$ref": "#/components/schemas/HTTPValidationError"
+-        }
+-       }
+-      },
+-      "description": "Validation Error"
+-     }
 +     "required": true
-+    },
-+    "responses": {
-+     "200": {
-+      "content": {
+     },
+-    "summary": "Public Lead"
+-   }
+-  },
+-  "/sites/{tenant_id}": {
+-   "get": {
+-    "operationId": "site_sites__tenant_id__get",
+-    "parameters": [
+-     {
+-      "in": "path",
+-      "name": "tenant_id",
+-      "required": true,
+-      "schema": {
+-       "title": "Tenant Id",
+-       "type": "string"
+-      }
+-     }
+-    ],
+     "responses": {
+      "200": {
+       "content": {
+-       "text/html": {
 +       "application/json": {
-+        "schema": {
+         "schema": {
+-         "type": "string"
 +         "additionalProperties": true,
 +         "title": "Response Design Make V1 Design Post",
 +         "type": "object"
-+        }
-+       }
-+      },
-+      "description": "Successful Response"
-+     },
-+     "422": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "$ref": "#/components/schemas/HTTPValidationError"
-+        }
-+       }
-+      },
-+      "description": "Validation Error"
-+     }
-+    },
+         }
+        }
+       },
+@@ -1915,12 +4981,12 @@
+       "description": "Validation Error"
+      }
+     },
+-    "summary": "Site"
 +    "summary": "Design Make"
-+   }
-+  },
+    }
+   },
+-  "/v1/analytics/campaign-metrics": {
+-   "post": {
+-    "operationId": "metrics_v1_analytics_campaign_metrics_post",
 +  "/v1/design/formats": {
 +   "get": {
 +    "operationId": "design_formats_v1_design_formats_get",
-+    "parameters": [
-+     {
-+      "in": "header",
-+      "name": "authorization",
-+      "required": false,
-+      "schema": {
-+       "anyOf": [
-+        {
-+         "type": "string"
-+        },
-+        {
-+         "type": "null"
-+        }
-+       ],
-+       "title": "Authorization"
-+      }
-+     }
-+    ],
-+    "responses": {
-+     "200": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "additionalProperties": true,
+     "parameters": [
+      {
+       "in": "header",
+@@ -1939,23 +5005,13 @@
+       }
+      }
+     ],
+-    "requestBody": {
+-     "content": {
+-      "application/json": {
+-       "schema": {
+-        "$ref": "#/components/schemas/MetricsIn"
+-       }
+-      }
+-     },
+-     "required": true
+-    },
+     "responses": {
+      "200": {
+       "content": {
+        "application/json": {
+         "schema": {
+          "additionalProperties": true,
+-         "title": "Response Metrics V1 Analytics Campaign Metrics Post",
 +         "title": "Response Design Formats V1 Design Formats Get",
-+         "type": "object"
-+        }
-+       }
-+      },
-+      "description": "Successful Response"
-+     },
-+     "422": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "$ref": "#/components/schemas/HTTPValidationError"
-+        }
-+       }
-+      },
-+      "description": "Validation Error"
-+     }
-+    },
+          "type": "object"
+         }
+        }
+@@ -1973,13 +5029,23 @@
+       "description": "Validation Error"
+      }
+     },
+-    "summary": "Metrics"
 +    "summary": "Design Formats"
-+   }
-+  },
+    }
+   },
+-  "/v1/analytics/campaigns": {
 +  "/v1/design/jobs/{job_id}": {
-+   "get": {
+    "get": {
+-    "operationId": "campaigns_v1_analytics_campaigns_get",
 +    "description": "How a design is going: working, done (with the image) or error.",
 +    "operationId": "design_job_v1_design_jobs__job_id__get",
-+    "parameters": [
+     "parameters": [
 +     {
 +      "in": "path",
 +      "name": "job_id",
@@ -9095,55 +10159,41 @@ index 1c8fa03..774d60d 100644
 +       "type": "string"
 +      }
 +     },
-+     {
-+      "in": "header",
-+      "name": "authorization",
-+      "required": false,
-+      "schema": {
-+       "anyOf": [
-+        {
-+         "type": "string"
-+        },
-+        {
-+         "type": "null"
-+        }
-+       ],
-+       "title": "Authorization"
-+      }
-+     }
-+    ],
-+    "responses": {
-+     "200": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
+      {
+       "in": "header",
+       "name": "authorization",
+@@ -2002,12 +5068,9 @@
+       "content": {
+        "application/json": {
+         "schema": {
+-         "items": {
+-          "additionalProperties": true,
+-          "type": "object"
+-         },
+-         "title": "Response Campaigns V1 Analytics Campaigns Get",
+-         "type": "array"
 +         "additionalProperties": true,
 +         "title": "Response Design Job V1 Design Jobs  Job Id  Get",
 +         "type": "object"
-+        }
-+       }
-+      },
-+      "description": "Successful Response"
-+     },
-+     "422": {
-+      "content": {
-+       "application/json": {
-+        "schema": {
-+         "$ref": "#/components/schemas/HTTPValidationError"
-+        }
-+       }
-+      },
-+      "description": "Validation Error"
-+     }
-+    },
+         }
+        }
+       },
+@@ -2024,13 +5087,23 @@
+       "description": "Validation Error"
+      }
+     },
+-    "summary": "Campaigns"
 +    "summary": "Design Job"
-+   }
-+  },
+    }
+   },
+-  "/v1/analytics/funnel": {
+-   "get": {
+-    "operationId": "funnel_v1_analytics_funnel_get",
 +  "/v1/design/jobs/{job_id}/items": {
 +   "post": {
 +    "description": "Turn a finished design into posts for the chosen platforms, waiting in the approval queue. Only a design that met the quality benchmark can be posted.",
 +    "operationId": "design_items_v1_design_jobs__job_id__items_post",
-+    "parameters": [
+     "parameters": [
 +     {
 +      "in": "path",
 +      "name": "job_id",
@@ -9153,23 +10203,13 @@ index 1c8fa03..774d60d 100644
 +       "type": "string"
 +      }
 +     },
-+     {
-+      "in": "header",
-+      "name": "authorization",
-+      "required": false,
-+      "schema": {
-+       "anyOf": [
-+        {
-+         "type": "string"
-+        },
-+        {
-+         "type": "null"
-+        }
-+       ],
-+       "title": "Authorization"
-+      }
-+     }
-+    ],
+      {
+       "in": "header",
+       "name": "authorization",
+@@ -2048,13 +5121,23 @@
+       }
+      }
+     ],
 +    "requestBody": {
 +     "content": {
 +      "application/json": {
@@ -9180,23 +10220,77 @@ index 1c8fa03..774d60d 100644
 +     },
 +     "required": true
 +    },
+     "responses": {
+      "200": {
+       "content": {
+        "application/json": {
+         "schema": {
+          "additionalProperties": true,
+-         "title": "Response Funnel V1 Analytics Funnel Get",
++         "title": "Response Design Items V1 Design Jobs  Job Id  Items Post",
+          "type": "object"
+         }
+        }
+@@ -2072,12 +5155,13 @@
+       "description": "Validation Error"
+      }
+     },
+-    "summary": "Funnel"
++    "summary": "Design Items"
+    }
+   },
+-  "/v1/approvals": {
+-   "get": {
+-    "operationId": "pending_v1_approvals_get",
++  "/v1/design/video": {
++   "post": {
++    "description": "A short silent vertical video made in the design studio: four scenes drawn by Muse Image (the owner's real photo opens and closes it), the studio's\nlettering, ffmpeg to join them, every scene rated against the quality benchmark. Runs in the background like a flyer.",
++    "operationId": "design_video_v1_design_video_post",
+     "parameters": [
+      {
+       "in": "header",
+@@ -2096,17 +5180,24 @@
+       }
+      }
+     ],
+-    "responses": {
+-     "200": {
+-      "content": {
+-       "application/json": {
+-        "schema": {
+-         "items": {
+-          "additionalProperties": true,
+-          "type": "object"
+-         },
+-         "title": "Response Pending V1 Approvals Get",
+-         "type": "array"
++    "requestBody": {
++     "content": {
++      "application/json": {
++       "schema": {
++        "$ref": "#/components/schemas/DesignVideoIn"
++       }
++      }
++     },
++     "required": true
++    },
 +    "responses": {
 +     "200": {
 +      "content": {
 +       "application/json": {
 +        "schema": {
 +         "additionalProperties": true,
-+         "title": "Response Design Items V1 Design Jobs  Job Id  Items Post",
++         "title": "Response Design Video V1 Design Video Post",
 +         "type": "object"
          }
         }
        },
-@@ -2123,22 +5112,13 @@
+@@ -2123,22 +5214,13 @@
        "description": "Validation Error"
       }
      },
 -    "summary": "Pending"
-+    "summary": "Design Items"
++    "summary": "Design Video"
     }
    },
 -  "/v1/approvals/{approval_id}/decision": {
@@ -9217,7 +10311,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -2160,7 +5140,7 @@
+@@ -2160,7 +5242,7 @@
       "content": {
        "application/json": {
         "schema": {
@@ -9226,7 +10320,7 @@ index 1c8fa03..774d60d 100644
         }
        }
       },
-@@ -2172,7 +5152,7 @@
+@@ -2172,7 +5254,7 @@
         "application/json": {
          "schema": {
           "additionalProperties": true,
@@ -9235,7 +10329,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -2190,20 +5170,20 @@
+@@ -2190,20 +5272,20 @@
        "description": "Validation Error"
       }
      },
@@ -9263,7 +10357,7 @@ index 1c8fa03..774d60d 100644
        }
       },
       {
-@@ -2228,12 +5208,9 @@
+@@ -2228,12 +5310,9 @@
        "content": {
         "application/json": {
          "schema": {
@@ -9279,7 +10373,7 @@ index 1c8fa03..774d60d 100644
          }
         }
        },
-@@ -2250,13 +5227,12 @@
+@@ -2250,13 +5329,12 @@
        "description": "Validation Error"
       }
      },
@@ -9297,7 +10391,7 @@ index 1c8fa03..774d60d 100644
      "parameters": [
       {
        "in": "header",
-@@ -2281,7 +5257,7 @@
+@@ -2281,7 +5359,7 @@
         "application/json": {
          "schema": {
           "additionalProperties": true,
@@ -9306,7 +10400,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -2299,12 +5275,13 @@
+@@ -2299,12 +5377,13 @@
        "description": "Validation Error"
       }
      },
@@ -9324,7 +10418,7 @@ index 1c8fa03..774d60d 100644
      "parameters": [
       {
        "in": "header",
-@@ -2323,23 +5300,13 @@
+@@ -2323,23 +5402,13 @@
        }
       }
      ],
@@ -9349,7 +10443,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -2357,12 +5324,11 @@
+@@ -2357,12 +5426,11 @@
        "description": "Validation Error"
       }
      },
@@ -9367,7 +10461,7 @@ index 1c8fa03..774d60d 100644
      "parameters": [
       {
        "in": "header",
-@@ -2387,7 +5353,7 @@
+@@ -2387,7 +5455,7 @@
         "application/json": {
          "schema": {
           "additionalProperties": true,
@@ -9376,7 +10470,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -2405,11 +5371,60 @@
+@@ -2405,11 +5473,60 @@
        "description": "Validation Error"
       }
      },
@@ -9441,7 +10535,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -2427,25 +5442,13 @@
+@@ -2427,25 +5544,13 @@
        }
       }
      ],
@@ -9468,7 +10562,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -2463,13 +5466,60 @@
+@@ -2463,13 +5568,60 @@
        "description": "Validation Error"
       }
      },
@@ -9532,7 +10626,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -2492,12 +5542,9 @@
+@@ -2492,12 +5644,9 @@
        "content": {
         "application/json": {
          "schema": {
@@ -9548,7 +10642,7 @@ index 1c8fa03..774d60d 100644
          }
         }
        },
-@@ -2514,22 +5561,14 @@
+@@ -2514,22 +5663,14 @@
        "description": "Validation Error"
       }
      },
@@ -9576,7 +10670,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -2547,13 +5586,23 @@
+@@ -2547,13 +5688,23 @@
        }
       }
      ],
@@ -9601,7 +10695,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -2571,22 +5620,14 @@
+@@ -2571,22 +5722,14 @@
        "description": "Validation Error"
       }
      },
@@ -9629,7 +10723,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -2604,13 +5645,23 @@
+@@ -2604,13 +5747,23 @@
        }
       }
      ],
@@ -9654,7 +10748,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -2628,20 +5679,40 @@
+@@ -2628,20 +5781,40 @@
        "description": "Validation Error"
       }
      },
@@ -9704,7 +10798,7 @@ index 1c8fa03..774d60d 100644
        }
       },
       {
-@@ -2661,24 +5732,17 @@
+@@ -2661,24 +5834,17 @@
        }
       }
      ],
@@ -9735,7 +10829,7 @@ index 1c8fa03..774d60d 100644
          }
         }
        },
-@@ -2695,12 +5759,12 @@
+@@ -2695,12 +5861,12 @@
        "description": "Validation Error"
       }
      },
@@ -9752,7 +10846,7 @@ index 1c8fa03..774d60d 100644
      "parameters": [
       {
        "in": "header",
-@@ -2724,12 +5788,9 @@
+@@ -2724,12 +5890,9 @@
        "content": {
         "application/json": {
          "schema": {
@@ -9768,7 +10862,7 @@ index 1c8fa03..774d60d 100644
          }
         }
        },
-@@ -2746,22 +5807,11 @@
+@@ -2746,22 +5909,11 @@
        "description": "Validation Error"
       }
      },
@@ -9795,7 +10889,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -2785,7 +5835,7 @@
+@@ -2785,7 +5937,7 @@
         "application/json": {
          "schema": {
           "additionalProperties": true,
@@ -9804,7 +10898,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -2803,29 +5853,11 @@
+@@ -2803,29 +5955,11 @@
        "description": "Validation Error"
       }
      },
@@ -9838,7 +10932,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -2843,17 +5875,24 @@
+@@ -2843,17 +5977,24 @@
        }
       }
      ],
@@ -9869,7 +10963,7 @@ index 1c8fa03..774d60d 100644
          }
         }
        },
-@@ -2870,12 +5909,12 @@
+@@ -2870,12 +6011,12 @@
        "description": "Validation Error"
       }
      },
@@ -9885,7 +10979,7 @@ index 1c8fa03..774d60d 100644
      "parameters": [
       {
        "in": "header",
-@@ -2898,7 +5937,7 @@
+@@ -2898,7 +6039,7 @@
       "content": {
        "application/json": {
         "schema": {
@@ -9894,7 +10988,7 @@ index 1c8fa03..774d60d 100644
         }
        }
       },
-@@ -2910,7 +5949,7 @@
+@@ -2910,7 +6051,7 @@
         "application/json": {
          "schema": {
           "additionalProperties": true,
@@ -9903,7 +10997,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -2928,12 +5967,12 @@
+@@ -2928,12 +6069,12 @@
        "description": "Validation Error"
       }
      },
@@ -9919,7 +11013,7 @@ index 1c8fa03..774d60d 100644
      "parameters": [
       {
        "in": "header",
-@@ -2958,7 +5997,7 @@
+@@ -2958,7 +6099,7 @@
         "application/json": {
          "schema": {
           "additionalProperties": true,
@@ -9928,7 +11022,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -2976,20 +6015,37 @@
+@@ -2976,20 +6117,37 @@
        "description": "Validation Error"
       }
      },
@@ -9972,7 +11066,7 @@ index 1c8fa03..774d60d 100644
        }
       },
       {
-@@ -3013,7 +6069,7 @@
+@@ -3013,7 +6171,7 @@
       "content": {
        "application/json": {
         "schema": {
@@ -9981,7 +11075,7 @@ index 1c8fa03..774d60d 100644
         }
        }
       },
-@@ -3025,7 +6081,7 @@
+@@ -3025,7 +6183,7 @@
         "application/json": {
          "schema": {
           "additionalProperties": true,
@@ -9990,7 +11084,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -3043,20 +6099,21 @@
+@@ -3043,20 +6201,21 @@
        "description": "Validation Error"
       }
      },
@@ -10018,7 +11112,7 @@ index 1c8fa03..774d60d 100644
        }
       },
       {
-@@ -3076,13 +6133,23 @@
+@@ -3076,13 +6235,23 @@
        }
       }
      ],
@@ -10043,7 +11137,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -3100,22 +6167,13 @@
+@@ -3100,22 +6269,13 @@
        "description": "Validation Error"
       }
      },
@@ -10069,7 +11163,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -3133,13 +6191,23 @@
+@@ -3133,13 +6293,23 @@
        }
       }
      ],
@@ -10094,7 +11188,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -3157,19 +6225,53 @@
+@@ -3157,19 +6327,53 @@
        "description": "Validation Error"
       }
      },
@@ -10156,7 +11250,7 @@ index 1c8fa03..774d60d 100644
         "type": "integer"
        }
       },
-@@ -3195,9 +6297,12 @@
+@@ -3195,9 +6399,12 @@
        "content": {
         "application/json": {
          "schema": {
@@ -10172,7 +11266,7 @@ index 1c8fa03..774d60d 100644
          }
         }
        },
-@@ -3214,19 +6319,19 @@
+@@ -3214,19 +6421,19 @@
        "description": "Validation Error"
       }
      },
@@ -10197,7 +11291,7 @@ index 1c8fa03..774d60d 100644
         "type": "integer"
        }
       },
-@@ -3251,7 +6356,11 @@
+@@ -3251,7 +6458,11 @@
       "200": {
        "content": {
         "application/json": {
@@ -10210,7 +11304,7 @@ index 1c8fa03..774d60d 100644
         }
        },
        "description": "Successful Response"
-@@ -3267,22 +6376,13 @@
+@@ -3267,22 +6478,13 @@
        "description": "Validation Error"
       }
      },
@@ -10237,7 +11331,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -3306,7 +6406,7 @@
+@@ -3306,7 +6508,7 @@
         "application/json": {
          "schema": {
           "additionalProperties": true,
@@ -10246,7 +11340,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -3324,19 +6424,40 @@
+@@ -3324,19 +6526,40 @@
        "description": "Validation Error"
       }
      },
@@ -10295,7 +11389,7 @@ index 1c8fa03..774d60d 100644
         "type": "integer"
        }
       },
-@@ -3362,9 +6483,12 @@
+@@ -3362,9 +6585,12 @@
        "content": {
         "application/json": {
          "schema": {
@@ -10311,7 +11405,7 @@ index 1c8fa03..774d60d 100644
          }
         }
        },
-@@ -3381,20 +6505,21 @@
+@@ -3381,20 +6607,21 @@
        "description": "Validation Error"
       }
      },
@@ -10339,7 +11433,7 @@ index 1c8fa03..774d60d 100644
        }
       },
       {
-@@ -3418,7 +6543,7 @@
+@@ -3418,7 +6645,7 @@
       "content": {
        "application/json": {
         "schema": {
@@ -10348,7 +11442,7 @@ index 1c8fa03..774d60d 100644
         }
        }
       },
-@@ -3430,7 +6555,7 @@
+@@ -3430,7 +6657,7 @@
         "application/json": {
          "schema": {
           "additionalProperties": true,
@@ -10357,7 +11451,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -3448,28 +6573,20 @@
+@@ -3448,28 +6675,20 @@
        "description": "Validation Error"
       }
      },
@@ -10393,7 +11487,7 @@ index 1c8fa03..774d60d 100644
         "type": "string"
        }
       },
-@@ -3490,13 +6607,23 @@
+@@ -3490,13 +6709,23 @@
        }
       }
      ],
@@ -10418,7 +11512,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -3514,16 +6641,16 @@
+@@ -3514,16 +6743,16 @@
        "description": "Validation Error"
       }
      },
@@ -10441,7 +11535,7 @@ index 1c8fa03..774d60d 100644
        "required": false,
        "schema": {
         "anyOf": [
-@@ -3534,41 +6661,20 @@
+@@ -3534,41 +6763,20 @@
           "type": "null"
          }
         ],
@@ -10495,7 +11589,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -3591,9 +6697,12 @@
+@@ -3591,9 +6799,12 @@
        "content": {
         "application/json": {
          "schema": {
@@ -10511,7 +11605,7 @@ index 1c8fa03..774d60d 100644
          }
         }
        },
-@@ -3610,42 +6719,13 @@
+@@ -3610,42 +6821,13 @@
        "description": "Validation Error"
       }
      },
@@ -10558,7 +11652,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -3668,12 +6748,9 @@
+@@ -3668,12 +6850,9 @@
        "content": {
         "application/json": {
          "schema": {
@@ -10574,7 +11668,7 @@ index 1c8fa03..774d60d 100644
          }
         }
        },
-@@ -3690,13 +6767,29 @@
+@@ -3690,13 +6869,29 @@
        "description": "Validation Error"
       }
      },
@@ -10608,7 +11702,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -3720,7 +6813,7 @@
+@@ -3720,7 +6915,7 @@
         "application/json": {
          "schema": {
           "additionalProperties": true,
@@ -10617,7 +11711,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -3738,10 +6831,12 @@
+@@ -3738,10 +6933,12 @@
        "description": "Validation Error"
       }
      },
@@ -10634,7 +11728,7 @@ index 1c8fa03..774d60d 100644
      "parameters": [
       {
        "in": "header",
-@@ -3760,13 +6855,23 @@
+@@ -3760,13 +6957,23 @@
        }
       }
      ],
@@ -10659,7 +11753,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -3784,10 +6889,12 @@
+@@ -3784,10 +6991,12 @@
        "description": "Validation Error"
       }
      },
@@ -10676,7 +11770,7 @@ index 1c8fa03..774d60d 100644
      "parameters": [
       {
        "in": "header",
-@@ -3810,7 +6917,7 @@
+@@ -3810,7 +7019,7 @@
       "content": {
        "application/json": {
         "schema": {
@@ -10685,7 +11779,7 @@ index 1c8fa03..774d60d 100644
         }
        }
       },
-@@ -3822,7 +6929,7 @@
+@@ -3822,7 +7031,7 @@
         "application/json": {
          "schema": {
           "additionalProperties": true,
@@ -10694,7 +11788,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -3840,12 +6947,12 @@
+@@ -3840,12 +7049,12 @@
        "description": "Validation Error"
       }
      },
@@ -10710,7 +11804,7 @@ index 1c8fa03..774d60d 100644
      "parameters": [
       {
        "in": "header",
-@@ -3868,7 +6975,7 @@
+@@ -3868,7 +7077,7 @@
       "content": {
        "application/json": {
         "schema": {
@@ -10719,7 +11813,7 @@ index 1c8fa03..774d60d 100644
         }
        }
       },
-@@ -3880,7 +6987,7 @@
+@@ -3880,7 +7089,7 @@
         "application/json": {
          "schema": {
           "additionalProperties": true,
@@ -10728,7 +11822,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -3898,13 +7005,22 @@
+@@ -3898,13 +7107,22 @@
        "description": "Validation Error"
       }
      },
@@ -10755,7 +11849,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -3928,7 +7044,7 @@
+@@ -3928,7 +7146,7 @@
         "application/json": {
          "schema": {
           "additionalProperties": true,
@@ -10764,7 +11858,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -3946,37 +7062,18 @@
+@@ -3946,37 +7164,18 @@
        "description": "Validation Error"
       }
      },
@@ -10808,7 +11902,7 @@ index 1c8fa03..774d60d 100644
        }
       },
       {
-@@ -4000,7 +7097,7 @@
+@@ -4000,7 +7199,7 @@
       "content": {
        "application/json": {
         "schema": {
@@ -10817,7 +11911,7 @@ index 1c8fa03..774d60d 100644
         }
        }
       },
-@@ -4012,7 +7109,7 @@
+@@ -4012,7 +7211,7 @@
         "application/json": {
          "schema": {
           "additionalProperties": true,
@@ -10826,7 +11920,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -4030,21 +7127,21 @@
+@@ -4030,21 +7229,21 @@
        "description": "Validation Error"
       }
      },
@@ -10856,7 +11950,7 @@ index 1c8fa03..774d60d 100644
        }
       },
       {
-@@ -4068,7 +7165,7 @@
+@@ -4068,7 +7267,7 @@
       "content": {
        "application/json": {
         "schema": {
@@ -10865,7 +11959,7 @@ index 1c8fa03..774d60d 100644
         }
        }
       },
-@@ -4080,7 +7177,7 @@
+@@ -4080,7 +7279,7 @@
         "application/json": {
          "schema": {
           "additionalProperties": true,
@@ -10874,7 +11968,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -4098,13 +7195,23 @@
+@@ -4098,13 +7297,23 @@
        "description": "Validation Error"
       }
      },
@@ -10901,7 +11995,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -4122,23 +7229,13 @@
+@@ -4122,23 +7331,13 @@
        }
       }
      ],
@@ -10926,7 +12020,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -4156,16 +7253,17 @@
+@@ -4156,16 +7355,17 @@
        "description": "Validation Error"
       }
      },
@@ -10950,7 +12044,7 @@ index 1c8fa03..774d60d 100644
        "required": false,
        "schema": {
         "anyOf": [
-@@ -4176,36 +7274,41 @@
+@@ -4176,36 +7376,41 @@
           "type": "null"
          }
         ],
@@ -11019,7 +12113,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -4228,12 +7331,9 @@
+@@ -4228,12 +7433,9 @@
        "content": {
         "application/json": {
          "schema": {
@@ -11035,7 +12129,7 @@ index 1c8fa03..774d60d 100644
          }
         }
        },
-@@ -4250,22 +7350,13 @@
+@@ -4250,22 +7452,13 @@
        "description": "Validation Error"
       }
      },
@@ -11062,7 +12156,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -4283,13 +7374,23 @@
+@@ -4283,13 +7476,23 @@
        }
       }
      ],
@@ -11087,7 +12181,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -4307,13 +7408,22 @@
+@@ -4307,13 +7510,22 @@
        "description": "Validation Error"
       }
      },
@@ -11113,7 +12207,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -4331,15 +7441,11 @@
+@@ -4331,15 +7543,11 @@
        }
       }
      ],
@@ -11134,7 +12228,7 @@ index 1c8fa03..774d60d 100644
         }
        },
        "description": "Successful Response"
-@@ -4355,41 +7461,18 @@
+@@ -4355,41 +7563,18 @@
        "description": "Validation Error"
       }
      },
@@ -11185,7 +12279,7 @@ index 1c8fa03..774d60d 100644
        }
       },
       {
-@@ -4409,17 +7492,24 @@
+@@ -4409,17 +7594,24 @@
        }
       }
      ],
@@ -11216,7 +12310,7 @@ index 1c8fa03..774d60d 100644
          }
         }
        },
-@@ -4436,20 +7526,20 @@
+@@ -4436,20 +7628,20 @@
        "description": "Validation Error"
       }
      },
@@ -11243,7 +12337,7 @@ index 1c8fa03..774d60d 100644
         "type": "string"
        }
       },
-@@ -4474,7 +7564,7 @@
+@@ -4474,7 +7666,7 @@
       "content": {
        "application/json": {
         "schema": {
@@ -11252,7 +12346,7 @@ index 1c8fa03..774d60d 100644
         }
        }
       },
-@@ -4486,7 +7576,7 @@
+@@ -4486,7 +7678,7 @@
         "application/json": {
          "schema": {
           "additionalProperties": true,
@@ -11261,7 +12355,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -4504,37 +7594,28 @@
+@@ -4504,37 +7696,28 @@
        "description": "Validation Error"
       }
      },
@@ -11312,7 +12406,7 @@ index 1c8fa03..774d60d 100644
         "type": "integer"
        }
       },
-@@ -4560,12 +7641,9 @@
+@@ -4560,12 +7743,9 @@
        "content": {
         "application/json": {
          "schema": {
@@ -11328,7 +12422,7 @@ index 1c8fa03..774d60d 100644
          }
         }
        },
-@@ -4582,13 +7660,29 @@
+@@ -4582,13 +7762,29 @@
        "description": "Validation Error"
       }
      },
@@ -11364,7 +12458,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -4610,11 +7704,7 @@
+@@ -4610,11 +7806,7 @@
       "200": {
        "content": {
         "application/json": {
@@ -11377,7 +12471,7 @@ index 1c8fa03..774d60d 100644
         }
        },
        "description": "Successful Response"
-@@ -4630,13 +7720,23 @@
+@@ -4630,13 +7822,23 @@
        "description": "Validation Error"
       }
      },
@@ -11405,7 +12499,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -4654,13 +7754,23 @@
+@@ -4654,13 +7856,23 @@
        }
       }
      ],
@@ -11430,7 +12524,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -4678,13 +7788,26 @@
+@@ -4678,13 +7890,26 @@
        "description": "Validation Error"
       }
      },
@@ -11461,7 +12555,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -4702,23 +7825,13 @@
+@@ -4702,23 +7927,13 @@
        }
       }
      ],
@@ -11486,7 +12580,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -4736,22 +7849,13 @@
+@@ -4736,22 +7951,13 @@
        "description": "Validation Error"
       }
      },
@@ -11512,7 +12606,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -4773,7 +7877,14 @@
+@@ -4773,7 +7979,14 @@
       "200": {
        "content": {
         "application/json": {
@@ -11528,7 +12622,7 @@ index 1c8fa03..774d60d 100644
         }
        },
        "description": "Successful Response"
-@@ -4789,20 +7900,11 @@
+@@ -4789,20 +8002,11 @@
        "description": "Validation Error"
       }
      },
@@ -11551,7 +12645,7 @@ index 1c8fa03..774d60d 100644
       {
        "in": "header",
        "name": "authorization",
-@@ -4824,7 +7926,7 @@
+@@ -4824,7 +8028,7 @@
       "content": {
        "application/json": {
         "schema": {
@@ -11560,7 +12654,7 @@ index 1c8fa03..774d60d 100644
         }
        }
       },
-@@ -4836,7 +7938,7 @@
+@@ -4836,7 +8040,7 @@
         "application/json": {
          "schema": {
           "additionalProperties": true,
@@ -11569,7 +12663,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -4854,21 +7956,20 @@
+@@ -4854,21 +8058,20 @@
        "description": "Validation Error"
       }
      },
@@ -11598,7 +12692,7 @@ index 1c8fa03..774d60d 100644
        }
       },
       {
-@@ -4888,23 +7989,13 @@
+@@ -4888,23 +8091,13 @@
        }
       }
      ],
@@ -11623,7 +12717,7 @@ index 1c8fa03..774d60d 100644
           "type": "object"
          }
         }
-@@ -4922,7 +8013,7 @@
+@@ -4922,7 +8115,7 @@
        "description": "Validation Error"
       }
      },
@@ -15480,7 +16574,7 @@ index 39aac8f..e0c5efd 100644
  
  /** The platform key an item targets: instagram, facebook, whatsapp_status, tiktok, x, or "meta" when no surface was chosen. */
 diff --git a/web/lib/types.ts b/web/lib/types.ts
-index 3691d0d..4b8d1ec 100644
+index 3691d0d..a71416b 100644
 --- a/web/lib/types.ts
 +++ b/web/lib/types.ts
 @@ -17,6 +17,7 @@ export type Me = {
@@ -15629,7 +16723,7 @@ index 3691d0d..4b8d1ec 100644
 +export type HistoryEntry = { ts: string; kind: string; text: string; actor: string; ref: string };
 +export type HistoryPage = { items: HistoryEntry[]; next_before: string | null };
 +
-+export interface DesignResult { image: string; score: number; summary: string; notes: string[]; issues: string[]; art: string; brain: boolean; asked: string[]; price: string; headline: string; file: string; passed: boolean; checked: boolean; min_score: number; attempts: number; caption: string; price_kobo: number | null }
++export interface DesignResult { kind?: "image" | "video"; video?: string | null; frames?: string[]; improve?: string[]; image: string; score: number; summary: string; notes: string[]; issues: string[]; art: string; brain: boolean; asked: string[]; price: string; headline: string; file: string; passed: boolean; checked: boolean; min_score: number; attempts: number; caption: string; price_kobo: number | null }
 diff --git a/web/next.config.ts b/web/next.config.ts
 index d6d32f6..15623dc 100644
 --- a/web/next.config.ts

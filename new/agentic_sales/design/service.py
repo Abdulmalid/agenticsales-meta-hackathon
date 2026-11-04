@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
+import json
 import re
 import secrets
 import threading
@@ -11,7 +13,7 @@ import time
 from pathlib import Path
 
 from ..config.business import BusinessConfig
-from ..models.base import ModelRouter, TaskKind
+from ..models.base import Message, ModelError, ModelRequest, ModelRouter, TaskKind
 from ..models.meta import MetaImage
 
 MAX_REQUEST = 600
@@ -60,20 +62,48 @@ def build_studio(router: ModelRouter, out_dir: Path, photo: bytes | None = None)
     return studio
 
 
-MAX_DESIGNS, GIVE_UP_AFTER = 2, 200.0
+MIN_ATTEMPT = 30.0
+MAX_DESIGNS, TOTAL_SECONDS, SAFE_RESERVE = 3, 190.0, 50.0          # the whole job should not run past about three minutes
 
 
-async def _until_good_enough(studio, brief):
-    """Designs until one reaches the benchmark, at most MAX_DESIGNS and not past GIVE_UP_AFTER seconds (each takes minutes). The best is kept."""
+def _found(res) -> list[str]:
+    """What the art director and the checks found wrong with a design, in plain words."""
+    c = res.critic or {}
+    out = [str(x) for x in (c.get("issues") or []) + (c.get("fixes") or [])] + [str(i) for i in res.issues if i.severity == "error"]
+    return list(dict.fromkeys(" ".join(x.split())[:200] for x in out if x))[:8]
+
+
+def _learn(brief, problems: list[str]) -> None:
+    """Tell the next design what the last one got wrong."""
+    if problems:
+        brief.avoid = [*brief.avoid, *problems][:10]
+        brief.notes = (brief.notes + " Problems found in the previous attempt, fix every one: " + "; ".join(problems))[:1500]
+
+
+async def _until_good_enough(studio, brief, fix: list[str] | None = None):
+    """Designs until one reaches the benchmark, learning from what each attempt got wrong. Two attempts with the picture model, then (or sooner, if time
+    is short) a last attempt on a drawn backdrop, which is fast and always leaves calm space for the words. The best is kept."""
+    from .studio import FixedArt, ProceduralArt
     started, best = time.monotonic(), None
+    _learn(brief, fix or [])
     for attempt in range(1, MAX_DESIGNS + 1):
-        res = await studio.design(brief)
-        if best is None or res.score > best.score:
+        left = TOTAL_SECONDS - (time.monotonic() - started)
+        last = attempt == MAX_DESIGNS or left < SAFE_RESERVE + MIN_ATTEMPT          # no time for another picture-model attempt
+        if last and not isinstance(studio.art, FixedArt):
+            studio.art, studio.inspector, studio.art_retries = ProceduralArt(), None, 0
+        if attempt > 1:
+            studio.art_retries = 0
+        res = None
+        try:
+            res = await (studio.design(brief) if last else asyncio.wait_for(studio.design(brief), max(MIN_ATTEMPT, left - SAFE_RESERVE)))
+        except asyncio.TimeoutError:
+            pass                                                           # too slow: the next attempt is the quick one
+        if res is not None and (best is None or res.score > best.score):
             best = res
-        if best.checked and best.score >= studio.min_score:
+        if (best is not None and best.checked and best.score >= studio.min_score) or last:
             break
-        if time.monotonic() - started > GIVE_UP_AFTER:
-            break
+        if res is not None:
+            _learn(brief, _found(res))
     return best, attempt
 
 
@@ -85,7 +115,7 @@ def suggested_caption(brief, cfg: BusinessConfig) -> str:
 
 
 def make(router: ModelRouter, cfg: BusinessConfig, out_dir: Path, request: str, fmt: str = DEFAULT_FORMAT, sku: str | None = None,
-         photo: Path | None = None) -> dict:
+         photo: Path | None = None, fix: list[str] | None = None) -> dict:
     """One finished design. With a `sku` the headline and price are the catalogue's own; otherwise a model reads the request into a brief, and the
     claim guard strips anything in the copy the request did not say."""
     missing = available()
@@ -115,7 +145,7 @@ def make(router: ModelRouter, cfg: BusinessConfig, out_dir: Path, request: str, 
             brief, questions = await DesignService(studio).intake(request, brand)
             brief.format, brief.variants = fmt, 1
             res = None
-        res, attempts = await _until_good_enough(studio, brief)
+        res, attempts = await _until_good_enough(studio, brief, [" ".join(str(x).split())[:200] for x in (fix or [])][:8])
         png = res.files["png"].read_bytes()
         jpg = res.files["jpg"].read_bytes()
         passed = res.checked and res.score >= studio.min_score
@@ -123,7 +153,7 @@ def make(router: ModelRouter, cfg: BusinessConfig, out_dir: Path, request: str, 
         price_kobo = int(digits) * 100 if digits else None
         return {"image": "data:image/jpeg;base64," + base64.b64encode(jpg).decode(), "png_bytes": len(png), "score": round(res.score),
                 "passed": passed, "checked": res.checked, "min_score": round(studio.min_score), "attempts": attempts, "caption": suggested_caption(brief, cfg), "price_kobo": price_kobo,
-                "summary": res.summary(), "notes": res.notes, "issues": [str(i) for i in res.issues if i.severity == "error"],
+                "improve": [] if passed else _found(res), "kind": "image", "summary": res.summary(), "notes": res.notes, "issues": [str(i) for i in res.issues if i.severity == "error"],
                 "art": studio.art.name, "brain": bool(studio.llm), "asked": questions, "price": brief.price, "headline": brief.headline,
                 "file": re.sub(r"^.*[\\/]", "", str(res.files["png"]))}
 
@@ -159,6 +189,137 @@ def compose_frame(cfg: BusinessConfig, picture: bytes, headline: str, product=No
         if not errors or not apply_repairs(spec, errors):
             break
     return render_svg(cv.to_svg(), 720, 1280)
+
+
+VIDEO_SYSTEM = """You plan a short silent vertical video ad (4 scenes, about 12 seconds) for a small Nigerian business, from the owner's request.
+Reply with JSON only: {"beats":[{"visual":"what the picture shows","text":"words on screen"}]}.
+Each visual describes the product and its setting only: no people, hands or faces, and no text in the picture. Each text is at most 6 words, plain and true to
+the request: no prices, phone numbers, discounts or claims the request did not give. The first scene is a hook and the last is the call to order."""
+VIDEO_SECONDS, VIDEO_TRIES = 3.0, 3
+MAX_INLINE_VIDEO = 3_000_000          # the console reaches the server through a proxy that cannot carry more than a few MB in one answer
+
+
+def _plan_beats(model, request: str, product, cfg: BusinessConfig) -> list[tuple[str, str]]:
+    """(what the picture shows, words on screen) for each scene. Muse Spark writes them from the owner's request; if it cannot, plain ones are made from the product."""
+    name = product.name if product else " ".join(request.split()[:6])
+    plain = [(f"{name}, hero shot on a clean styled surface", name), (f"Close-up of the details of {name}", ""),
+             (f"{name} in a believable everyday setting", ""), (f"{name} front and centre", "Order today")]
+    if model is None:
+        return plain
+    facts = f"Business: {cfg.business_name}. " + (f"Product: {product.name}. {product.description}. " if product else "") + f"Request: {request}"
+    try:
+        res = model.complete(ModelRequest(VIDEO_SYSTEM, (Message("user", facts),), max_tokens=1200, temperature=0.4))
+        m = re.search(r"[{].*[}]", res.text, re.S)
+        beats = [(" ".join(str(b.get("visual") or "").split())[:300], " ".join(str(b.get("text") or "").split()[:6]))
+                 for b in (json.loads(m.group(0)).get("beats") or []) if isinstance(b, dict)][:4] if m else []
+        return beats if len(beats) >= 2 and all(v for v, _ in beats) else plain
+    except Exception:                                                      # noqa: BLE001 - a plan that fails is replaced by the plain one
+        return plain
+
+
+def _scene_brief(visual: str, product, note: str = "") -> str:
+    named = f" The product: {product.name}. {product.description}".rstrip() if product else ""
+    return (f"Vertical 9:16 photograph. Show exactly this: {visual}.{named} Show only the product and its setting: no people, no hands, no faces, no body parts. "
+            "No text, letters, numbers, signs, logos or watermarks anywhere. A full-bleed picture that fills the frame edge to edge, with the product in the middle: "
+            "no borders, bars or empty bands." + note)
+
+
+def _jpeg(png: bytes, width: int | None = None, quality: int = 85) -> bytes:
+    from PIL import Image
+    im = Image.open(io.BytesIO(png)).convert("RGB")
+    if width and im.width > width:
+        im = im.resize((width, int(im.height * width / im.width)))
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=quality)
+    return buf.getvalue()
+
+
+def make_video(router: ModelRouter, cfg: BusinessConfig, out_dir: Path, request: str, sku: str | None = None, photo: Path | None = None,
+               fix: list[str] | None = None) -> dict:
+    """A short silent vertical video: Muse Spark plans four scenes, Muse Image draws each (the owner's real photo opens and closes it when there is one),
+    the studio sets the words as vector type and ffmpeg joins them. Every scene is rated by Muse Spark looking at it, and a scene that will not reach the
+    benchmark is replaced by the owner's real photo when there is one. The video's score is its weakest scene."""
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    from ..content import reel
+    from . import quality
+    missing = available()
+    if missing:
+        raise DesignError(missing)
+    request = " ".join(request.split())[:MAX_REQUEST]
+    if len(request) < 8:
+        raise DesignError("Say what the video is for, in a sentence.")
+    product = cfg.product(sku) if sku else None
+    if sku and product is None:
+        raise DesignError("That product is not in your catalogue.")
+    try:
+        media = router.media_model(TaskKind.IMAGE)
+    except ModelError as e:
+        raise DesignError(str(e)[:200]) from None
+    model = router.text.get(TaskKind.REASONING) or router.text.get(TaskKind.CONVERSATION)
+    fixes = [" ".join(str(x).split())[:200] for x in (fix or [])][:8]
+    beats = _plan_beats(model, request + (" Fix these problems from the last attempt: " + "; ".join(fixes) if fixes else ""), product, cfg)
+    real = photo.read_bytes() if photo is not None and sku and photo.exists() else None
+    keep_real = {0, len(beats) - 1} if real else set()
+    notes: list[str] = []
+
+    def scene(i: int):
+        visual, _words = beats[i]
+        if i in keep_real:
+            return real, quality.rate_picture(model, real, visual)[0], []
+        best, note = (None, -1.0, []), ""
+        for _ in range(VIDEO_TRIES):
+            try:
+                data = media.generate(_scene_brief(visual, product, note))
+            except ModelError:
+                if best[0] is None:
+                    raise
+                break
+            score, issues = quality.rate_picture(model, data, visual)
+            if score is None:
+                return data, None, []
+            if score > best[1]:
+                best = (data, score, issues)
+            if score >= quality.MIN_SCORE:
+                break
+            note = " Fix these defects from the last attempt: " + "; ".join(issues) + "."
+        if best[1] < quality.MIN_SCORE and real:                              # the owner's own photo beats a picture that will not come out right
+            notes.append(f"scene {i + 1}: the drawn picture rated {best[1]:.0f}, so your real photo is used")
+            return real, quality.rate_picture(model, real, visual)[0], []
+        return best[0], best[1], best[2]
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            got = list(pool.map(scene, range(len(beats))))
+    except ModelError as e:
+        raise DesignError(f"The pictures could not be made: {str(e)[:160]}") from None
+    frames, pngs, scores, defects = [], [], [], []
+    for i, ((_visual, words), (pic, score, issues)) in enumerate(zip(beats, got)):
+        last = i == len(beats) - 1
+        done = compose_frame(cfg, pic, words, product=product if last else None) if (words or last) else pic
+        pngs.append(done)
+        frames.append(reel.Frame(done, "", VIDEO_SECONDS))
+        scores.append(score)
+        defects += [f"scene {i + 1}: {x}" for x in issues] if score is not None and score < quality.MIN_SCORE else []
+    checked = all(s is not None for s in scores)
+    score = round(min(scores)) if checked else 0
+    passed = checked and score >= quality.MIN_SCORE
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = f"video_{secrets.token_hex(5)}.mp4"
+    try:
+        reel.render(frames, out_dir / name)
+    except reel.ReelError as e:
+        raise DesignError(str(e)) from None
+    size = (out_dir / name).stat().st_size
+    headline = product.name if product else next((w for _, w in beats if w), "")
+    story = SimpleNamespace(headline=headline, offer="", price=_naira(product.price_kobo) if product else "", details=[], cta="Order on WhatsApp" if cfg.whatsapp else "")
+    return {"kind": "video", "image": "data:image/jpeg;base64," + base64.b64encode(_jpeg(pngs[0], 720)).decode(),
+            "video": ("data:video/mp4;base64," + base64.b64encode((out_dir / name).read_bytes()).decode()) if size <= MAX_INLINE_VIDEO else None,
+            "frames": ["data:image/jpeg;base64," + base64.b64encode(_jpeg(p, 200, 70)).decode() for p in pngs],
+            "png_bytes": size, "score": score, "passed": passed, "checked": checked, "min_score": round(quality.MIN_SCORE), "attempts": 1,
+            "caption": suggested_caption(story, cfg), "price_kobo": product.price_kobo if product else None, "improve": [] if passed else defects[:8],
+            "summary": f"video of {len(frames)} scenes, weakest scene {score}", "notes": notes, "issues": [], "art": "muse-image + studio type", "brain": model is not None,
+            "asked": [], "price": story.price, "headline": headline, "file": name}
 
 
 class Jobs:
