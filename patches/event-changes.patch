@@ -1935,7 +1935,7 @@ index 1b32b63..a87a972 100644
 +        secrets.update(kind, access_token=t.access, expires_at=expires)
 +        self.auth.connections.set_expiry(tenant, kind, expires or None)
 diff --git a/agentic_sales/content/publishers.py b/agentic_sales/content/publishers.py
-index b469d4d..bcfbd72 100644
+index b469d4d..a62cb9a 100644
 --- a/agentic_sales/content/publishers.py
 +++ b/agentic_sales/content/publishers.py
 @@ -12,14 +12,31 @@ TikTok and WhatsApp Status have no publisher: the console shows the post ready t
@@ -2032,7 +2032,7 @@ index b469d4d..bcfbd72 100644
              res = self._call(f"{GRAPH}/{page}/photos", token, {"url": item["image_url"], "caption": text})
          else:
              res = self._call(f"{GRAPH}/{page}/feed", token, {"message": text})
-@@ -72,17 +128,177 @@ class InstagramPublisher(_Base):
+@@ -72,17 +128,179 @@ class InstagramPublisher(_Base):
          token, ig = secrets.get("access_token"), secrets.get("ig_user_id") or secrets.get("page_id")
          if not (token and ig):
              raise ChannelUnavailable("Instagram needs an access token and the Instagram business account ID")
@@ -2050,25 +2050,27 @@ index b469d4d..bcfbd72 100644
              raise PublishError("Instagram did not return a media container id")
 -        done = self._call(f"{GRAPH}/{ig}/media_publish", token, {"creation_id": made["id"]})
 +        readable = self._wait_for_video(api, made["id"], token) if video else True
-+        done = self._publish_container(f"{api}/{ig}/media_publish", token, made["id"], patient=not readable)
++        done = (self._publish_container(f"{api}/{ig}/media_publish", token, made["id"], patient=not readable) if video else
++                self._publish_container(f"{api}/{ig}/media_publish", token, made["id"], patient=True, tries=12, pause=3))          # a picture needs a few seconds too
          if not done.get("id"):
              raise PublishError("Instagram did not confirm the post")
          return f"instagram:{done['id']}"
  
  
-+    def _publish_container(self, url: str, token: str, container: str, patient: bool) -> dict:
++    def _publish_container(self, url: str, token: str, container: str, patient: bool, tries: int = 60, pause: float = 5) -> dict:
 +        """Publish a container. When Instagram would not report the video's status, the only way to know it is ready is to try, so keep
 +        trying for a few minutes while it answers that the media is not ready yet."""
-+        for attempt in range(60 if patient else 1):
++        last = ""
++        for attempt in range(tries if patient else 1):
 +            if attempt:
-+                _sleep(5)
++                _sleep(pause)
 +            try:
 +                return self._call(url, token, {"creation_id": container})
 +            except PublishError as e:
-+                if not patient or not re.search(r"not ready|9007|2207027|still processing|try again", str(e), re.I):
++                if not patient or not re.search(r"not ready|not available|9007|2207027|2207006|still processing|try again", str(e), re.I):
 +                    raise
 +                last = str(e)
-+        raise PublishError(f"Instagram is still processing the video after five minutes. Try publishing again later. (last answer: {last[:160]})")
++        raise PublishError(f"Instagram is still processing the media. Try publishing again in a minute. (last answer: {last[:160]})")
 +
 +    def _wait_for_video(self, api: str, container: str, token: str) -> bool:
 +        """Instagram processes a video after the container is made; it can be published only once the status says FINISHED.
@@ -2214,7 +2216,7 @@ index b469d4d..bcfbd72 100644
  class XPublisher(_Base):
      key = "x"
  
-@@ -101,10 +317,10 @@ class XPublisher(_Base):
+@@ -101,10 +319,10 @@ class XPublisher(_Base):
  
  
  def default_publishers(http: HttpPost = post_json) -> dict[str, _Base]:

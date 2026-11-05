@@ -22,6 +22,16 @@ In short: before the event I had the skeleton of the product. Everything that ma
 
 `HACKATHON.md` lists every feature with its commit and date, and says which ones I ran for real and which are only unit-tested.
 
+## Trying the live demo
+
+Live at https://agenticsalesrep.duckdns.org. The customer side needs no account: open `/chat/demo` (text, photos and voice notes; the page explains the demo conditions). What to expect:
+
+- **Payments are Paystack test mode.** No real money moves. Use Paystack's test card 4084 0840 8408 4081, any future expiry, CVV 408. Only Paystack's confirmation counts as payment; a screenshot or a pasted reference is checked with Paystack by the server.
+- **The owner console needs a login**, so a judge cannot open it without credentials. The demo video shows it (inventory import, Under the hood, orders and tracking, the design studio). Judge login details are in the submission form notes, with the names of the connected accounts so you can check that a post really arrived.
+- **Channels:** the rep is live on the web chat and Telegram. Instagram and WhatsApp direct messages are built but blocked by Meta account restrictions, so they are not part of the demo.
+- **Hosting:** a free web address (DuckDNS) and an Oracle trial server whose credit ends around 8 Nov, so it can be slow, and may be offline during later judging.
+- **Slow things:** a flyer takes up to about three minutes and a video a few more, because Muse Image draws each picture. Videos are silent because Meta has no speech or video model.
+
 ## How the pieces fit
 
 `setup.sh` (or `setup.ps1` on Windows) clones the baseline at the pinned commit (`e2ddc9c0213e571c3ea2edf3f42a016ccaae7194`), copies `new/` over it, and applies the patch. The result is the full app. I checked that this rebuilds all 204 changed files byte for byte identical to my working copy, and that the backend test suite passes on the rebuilt copy (751 tests, 28 skipped for missing keys or services). The full run passes on the rebuilt copy.

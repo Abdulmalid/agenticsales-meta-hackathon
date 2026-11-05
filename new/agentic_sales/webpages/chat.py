@@ -23,6 +23,7 @@ header{padding:.8rem 1rem;border-bottom:1px solid var(--line)}header h1{margin:0
 .msg.bot{align-self:flex-start;background:var(--bot);border:1px solid var(--line);border-bottom-left-radius:4px}
 .msg img{display:block;max-width:220px;width:100%;border-radius:10px;margin-bottom:.3rem}
 .hint{align-self:center;color:var(--muted);font-size:.85rem;text-align:center;max-width:90%}
+.hint.demo{border:1px dashed var(--line);border-radius:10px;padding:.5rem .7rem;font-size:.8rem}
 form{display:flex;gap:.4rem;padding:.6rem;border-top:1px solid var(--line);align-items:flex-end}
 textarea{flex:1;resize:none;min-height:44px;max-height:120px;padding:.6rem .7rem;border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--fg);font:inherit}
 button,label.btn{border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:12px;min-width:44px;height:44px;padding:0 .7rem;font:inherit;cursor:pointer;display:inline-flex;align-items:center;justify-content:center}
@@ -145,7 +146,10 @@ def page(tenant_id: str, business_name: str, agent_name: str = "") -> str:
             f'<link rel="icon" href="data:,"><title>Chat with {name}</title><style>{STYLE}</style></head><body><div class="app">'
             f'<header><h1>{name}</h1><div class="sub">You are chatting with {who}, a virtual sales assistant</div></header>'
             '<div id="log" role="log" aria-live="polite"><div class="hint">Ask about products, prices or delivery. You can send a photo of what you want, or a voice note. '
-            "A team member can step in at any time.</div></div>"
+            "A team member can step in at any time.</div>"
+            '<div class="hint demo"><b>Hackathon demo.</b> This is a prototype built for the Meta Global AI Developer Hackathon. Payments run in Paystack test mode, so no real money moves: '
+            "use Paystack's test card 4084 0840 8408 4081, any future expiry date, CVV 408. Instagram and WhatsApp messages are blocked by Meta for now, so this page and Telegram are where the "
+            "rep is live. It runs on a free trial server and a free web address, so it can be slow, and may go offline after 8 Nov.</div></div>"
             '<div id="preview"><img id="pimg" alt="Photo ready to send"><button type="button" id="rm">Remove photo</button></div>'
             '<form id="f"><label class="btn" title="Send a photo"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg><input id="file" type="file" accept="image/*" hidden aria-label="Attach a photo"></label>'
             '<button type="button" id="mic" aria-label="Record a voice note"><svg class="i-mic" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg><svg class="i-stop" width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>'

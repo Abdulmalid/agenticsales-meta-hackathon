@@ -229,6 +229,26 @@ class PostingTheVideo(unittest.TestCase):
         self.assertEqual([c[0] for c in calls], ["media", "media_publish"])
         self.assertEqual((calls[0][1]["media_type"], calls[0][1]["video_url"]), ("REELS", self.ITEM["video_url"]))
 
+    def test_instagram_keeps_trying_a_picture_until_it_says_the_media_is_ready(self):
+        from agentic_sales.content.publishers import PublishError
+        answers = iter([PublishError("instagram HTTP 400: Media ID is not available"), PublishError("instagram HTTP 400: Media ID is not available"), {"id": "99"}])
+        calls = []
+
+        def post(url, h, b, **k):
+            calls.append(url.rsplit("/", 1)[1])
+            if url.endswith("/media"):
+                return {"id": "55"}
+            a = next(answers)
+            if isinstance(a, Exception):
+                raise ModelError(str(a))
+            return a
+        pub = InstagramPublisher(post)
+        with mock.patch("agentic_sales.content.publishers._sleep") as slept:
+            ref = pub.publish({"caption": "New iPhone 15", "hashtags": [], "image_url": "https://x.test/a.jpg"}, {"access_token": "t", "ig_user_id": "1"})
+        self.assertEqual(ref, "instagram:99")
+        self.assertEqual(calls, ["media", "media_publish", "media_publish", "media_publish"])
+        self.assertEqual(slept.call_count, 2)
+
     def test_instagram_does_not_publish_a_video_it_could_not_process(self):
         from agentic_sales.content.publishers import PublishError
         pub = InstagramPublisher(lambda *a, **k: {"id": "55"}, get=lambda url, token: {"status_code": "ERROR"})
